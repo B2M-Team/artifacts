@@ -45,6 +45,10 @@ test('signature, issuer, audience, expiry and nonce are each enforced', async ()
   await assert.rejects(verifyIdToken(makeIdToken({ privateKey, kid: 'k9', claims: base }), opts), /unknown signing key/);
   await assert.rejects(verifyIdToken(makeIdToken({ privateKey, kid: 'k1', claims: { ...base, iss: 'https://evil' } }), opts), /wrong issuer/);
   await assert.rejects(verifyIdToken(makeIdToken({ privateKey, kid: 'k1', claims: { ...base, aud: 'other' } }), opts), /wrong audience/);
+  // An access token is signed by the same issuer but addressed to the resource server; the
+  // role fallback verifies it with the audience check off.
+  const at = await verifyIdToken(makeIdToken({ privateKey, kid: 'k1', claims: { ...base, aud: 'account', realm_access: { roles: ['reports-admin'] } } }), { ...opts, requireAudience: false });
+  assert.equal(hasRequiredRole(at, 'reports-admin'), true);
   await assert.rejects(verifyIdToken(makeIdToken({ privateKey, kid: 'k1', claims: { ...base, exp: now - 600 } }), opts), /expired/);
   await assert.rejects(verifyIdToken(makeIdToken({ privateKey, kid: 'k1', claims: { ...base, nonce: 'zz' } }), opts), /nonce mismatch/);
   await assert.rejects(verifyIdToken(makeIdToken({ privateKey, kid: 'k1', claims: base, alg: 'none' }), opts), /unsupported alg/);

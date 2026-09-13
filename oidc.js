@@ -108,7 +108,7 @@ export function createJwks(jwksUri) {
   };
 }
 
-export async function verifyIdToken(token, { jwks, issuerClaim, clientId, nonce }) {
+export async function verifyIdToken(token, { jwks, issuerClaim, clientId, nonce, requireAudience = true }) {
   const parts = String(token || '').split('.');
   if (parts.length !== 3) throw new Error('id_token: malformed');
   const [h, p, s] = parts;
@@ -123,7 +123,7 @@ export async function verifyIdToken(token, { jwks, issuerClaim, clientId, nonce 
   const now = Math.floor(Date.now() / 1000);
   if (claims.iss !== issuerClaim) throw new Error('id_token: wrong issuer');
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
-  if (!aud.includes(clientId)) throw new Error('id_token: wrong audience');
+  if (requireAudience && !aud.includes(clientId)) throw new Error('id_token: wrong audience');
   if (typeof claims.exp !== 'number' || claims.exp <= now - 30) throw new Error('id_token: expired');
   if (nonce && claims.nonce !== nonce) throw new Error('id_token: nonce mismatch');
   return claims;
@@ -210,7 +210,19 @@ export function mountOidc(app, cfg, discovery, deps) {
         nonce: flow.nonce,
       });
       const name = principalName(claims);
-      if (!hasRequiredRole(claims, cfg.requiredRole)) {
+      // Keycloak puts realm/client roles in the ACCESS token by default and only adds them to
+      // the id_token when the operator flips a mapper. So when the id_token has no such role,
+      // look in the access token too — but only after checking it is a JWT this issuer signed
+      // (its audience is the resource server's, not ours, so that check is skipped).
+      let roleClaims = claims;
+      if (cfg.requiredRole && !hasRequiredRole(claims, cfg.requiredRole) && typeof tokens.access_token === 'string' && tokens.access_token.split('.').length === 3) {
+        try {
+          roleClaims = await verifyIdToken(tokens.access_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId, requireAudience: false });
+        } catch (e) {
+          deps.logAuth('oidc', { username: name, outcome: 'access_token_unverified', error: e.message });
+        }
+      }
+      if (!hasRequiredRole(roleClaims, cfg.requiredRole)) {
         deps.logAuth('oidc', { username: name, outcome: 'forbidden' });
         return res.status(403).type('text/plain').send(`signed in as ${name}, but this account has no "${cfg.requiredRole}" role — ask an administrator`);
       }
