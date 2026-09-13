@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { oidcConfigFromEnv, verifyIdToken, hasRequiredRole, principalName } from '../oidc.js';
+import http from 'node:http';
+import { oidcConfigFromEnv, verifyIdToken, hasRequiredRole, principalName, createPasswordSignIn } from '../oidc.js';
 
 function b64url(x) {
   return Buffer.from(x).toString('base64url');
@@ -26,6 +27,7 @@ test('config is null without OIDC_ISSUER and throws when the client is half-conf
   assert.equal(cfg.issuer, 'https://sso.example/realms/r');
   assert.equal(cfg.internalIssuer, cfg.issuer);
   assert.equal(cfg.only, true, 'OIDC_ONLY defaults to true');
+  assert.equal(cfg.signinTitle, 'Sign in with your company account');
   assert.equal(oidcConfigFromEnv({ ...process.env, OIDC_ISSUER: 'x', OIDC_CLIENT_ID: 'a', OIDC_CLIENT_SECRET: 's', OIDC_ONLY: 'false' }).only, false);
 });
 
@@ -60,4 +62,45 @@ test('required role is looked up in realm, top-level and client roles', () => {
   assert.equal(hasRequiredRole({ realm_access: { roles: ['reports-admin'] } }, 'reports-admin'), true);
   assert.equal(hasRequiredRole({ roles: ['reports-admin'] }, 'reports-admin'), true);
   assert.equal(hasRequiredRole({ resource_access: { artifacts: { roles: ['reports-admin'] } } }, 'reports-admin'), true);
+});
+
+// The password grant end to end against a stub IdP: token endpoint + JWKS on a local server.
+test('createPasswordSignIn exchanges credentials with the IdP and enforces the role', async () => {
+  const jwk = publicKey.export({ format: 'jwk' });
+  const answers = {
+    'good:pw': { id: { ...base, aud: 'artifacts', preferred_username: 'good' }, at: { ...base, aud: 'account', realm_access: { roles: ['reports-admin'] } } },
+    'norole:pw': { id: { ...base, aud: 'artifacts', preferred_username: 'norole' }, at: { ...base, aud: 'account', realm_access: { roles: [] } } },
+  };
+  const srv = http.createServer(async (req, res) => {
+    if (req.url === '/certs') return res.end(JSON.stringify({ keys: [{ ...jwk, kid: 'k1', use: 'sig' }] }));
+    let body = ''; for await (const c of req) body += c;
+    const f = new URLSearchParams(body);
+    const a = answers[`${f.get('username')}:${f.get('password')}`];
+    if (f.get('grant_type') !== 'password' || !a) { res.statusCode = 401; return res.end(JSON.stringify({ error: 'invalid_grant' })); }
+    res.end(JSON.stringify({
+      id_token: makeIdToken({ privateKey, kid: 'k1', claims: { ...a.id, nonce: undefined } }),
+      access_token: makeIdToken({ privateKey, kid: 'k1', claims: a.at }),
+    }));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const port = srv.address().port;
+  const log = [];
+  try {
+    const cfg = { clientId: 'artifacts', clientSecret: 's', scopes: 'openid', requiredRole: 'reports-admin', only: true };
+    const disc = { tokenEndpoint: `http://127.0.0.1:${port}/token`, jwksUri: `http://127.0.0.1:${port}/certs`, issuerClaim: base.iss };
+    const signIn = createPasswordSignIn(cfg, disc, { logAuth: (e, f) => log.push(f.outcome) });
+    assert.equal(await signIn('good', 'pw'), 'good');
+    await assert.rejects(signIn('good', 'wrong'), (e) => e.status === 401);
+    await assert.rejects(signIn('norole', 'pw'), (e) => e.status === 403 && /reports-admin/.test(e.message));
+    assert.deepEqual(log, ['ok', 'refused', 'forbidden']);
+    const open = createPasswordSignIn({ ...cfg, requiredRole: '' }, disc, { logAuth: () => {} });
+    assert.equal(await open('norole', 'pw'), 'norole', 'no required role → any IdP account');
+  } finally {
+    srv.close();
+  }
+});
+
+test('an IdP that is down is a 502, not a 401', async () => {
+  const signIn = createPasswordSignIn({ clientId: 'a', clientSecret: 's', scopes: 'openid' }, { tokenEndpoint: 'http://127.0.0.1:1/token', jwksUri: 'http://127.0.0.1:1/certs', issuerClaim: 'x' }, { logAuth: () => {} });
+  await assert.rejects(signIn('u', 'p'), (e) => e.status === 502);
 });

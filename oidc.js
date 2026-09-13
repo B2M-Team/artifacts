@@ -1,7 +1,9 @@
-// OpenID Connect sign-in for the dashboard (authorization code + PKCE), so an
-// operator with a company IdP (Keycloak, Entra, Okta, …) does not run a second
-// password just for this app. Dependency-free: the id_token is verified with
-// node:crypto against the issuer's JWKS (RS256/RS384/RS512, ES256/384/512).
+// Company sign-in for the dashboard through an OpenID Connect provider, WITHOUT
+// leaving the app: the dashboard keeps its own username/password form and this
+// module exchanges those credentials with the IdP's token endpoint (resource
+// owner password grant — "direct access grant" in Keycloak). No redirect to the
+// IdP's pages, no callback URL, no second password. Dependency-free: the id_token
+// is verified with node:crypto against the issuer's JWKS (RS*/ES*).
 //
 // Env:
 //   OIDC_ISSUER           public issuer, e.g. https://sso.example.com/auth/realms/main (enables OIDC)
@@ -11,13 +13,11 @@
 //                         the token and JWKS calls. The browser still goes to OIDC_ISSUER.
 //   OIDC_REQUIRED_ROLE    optional: a realm/app role the id_token must carry (realm_access.roles
 //                         or roles claim). Empty = every authenticated user is an admin.
-//   OIDC_ONLY             "true" (default when OIDC is on) hides the local username/password form.
-//   OIDC_RETURN_PATH      where the browser lands after sign-in/sign-out, default "/"
+//   OIDC_ONLY             "true" (default) — the form only accepts IdP accounts. "false" — when the
+//                         IdP refuses, the local admin account is tried as a break-glass fallback.
 //   OIDC_SCOPES           default "openid profile email"
+//   OIDC_SIGNIN_TITLE     text over the form, default "Sign in with your company account"
 import crypto from 'node:crypto';
-
-const OIDC_COOKIE = 'artifacts_oidc';
-const FLOW_TTL_MS = 10 * 60 * 1000;
 
 export function oidcConfigFromEnv(env = process.env) {
   const issuer = (env.OIDC_ISSUER || '').replace(/\/$/, '');
@@ -35,8 +35,8 @@ export function oidcConfigFromEnv(env = process.env) {
     clientSecret,
     requiredRole: env.OIDC_REQUIRED_ROLE || '',
     only,
-    returnPath: env.OIDC_RETURN_PATH || '/',
     scopes: env.OIDC_SCOPES || 'openid profile email',
+    signinTitle: env.OIDC_SIGNIN_TITLE || 'Sign in with your company account',
   };
 }
 
@@ -48,10 +48,10 @@ export async function loadDiscovery(cfg) {
   const res = await fetch(`${cfg.internalIssuer}/.well-known/openid-configuration`);
   if (!res.ok) throw new Error(`oidc discovery ${res.status} from ${cfg.internalIssuer}`);
   const d = await res.json();
-  // Keycloak answers discovery with whatever hostname it was configured with. Endpoints the
-  // BROWSER visits are rebuilt on the public issuer's origin; endpoints THIS SERVER calls
-  // (token, jwks) on the internal one, so sign-in never depends on egress to the public
-  // ingress. Only the origin is swapped, the path is the IdP's own.
+  // Keycloak answers discovery with whatever hostname it was configured with. The only
+  // endpoints used (token, jwks) are called by THIS SERVER, so they are rebuilt on the
+  // internal origin: sign-in never depends on egress to the public ingress. Only the
+  // origin is swapped, the path is the IdP's own.
   const onOrigin = (url, base) => {
     if (!url) return url;
     const b = new URL(base);
@@ -60,13 +60,14 @@ export async function loadDiscovery(cfg) {
     u.host = b.host;
     return u.toString();
   };
+  if (!(d.grant_types_supported || ['password']).includes('password')) {
+    throw new Error('the IdP does not advertise the password grant; enable direct access grants on the client');
+  }
   return {
-    authorizationEndpoint: onOrigin(d.authorization_endpoint, cfg.issuer),
-    endSessionEndpoint: d.end_session_endpoint ? onOrigin(d.end_session_endpoint, cfg.issuer) : null,
     tokenEndpoint: onOrigin(d.token_endpoint, cfg.internalIssuer),
     jwksUri: onOrigin(d.jwks_uri, cfg.internalIssuer),
-    // The id_token is minted for a browser that came in through the public issuer, so
-    // that is the `iss` it carries — not the internal hostname discovery may report.
+    // Tokens carry the public issuer in `iss` (Keycloak's frontend URL), not the internal
+    // hostname discovery may have been fetched from.
     issuerClaim: cfg.issuer,
   };
 }
@@ -143,106 +144,60 @@ export function principalName(claims) {
   return claims.preferred_username || claims.email || claims.sub;
 }
 
-// Mounts /api/auth/oidc/{login,callback,logout}. `deps` supplies what the host app owns:
-//   signSession/verifySession(payload|token, secret), ensureSessionSecret(), issueSession(res, name, extra),
-//   readCookie(req, name), baseUrl, logAuth(event, fields)
-export function mountOidc(app, cfg, discovery, deps) {
+// Exchanges a username/password with the IdP (resource owner password grant) and returns
+// the signed-in principal's name. Throws { status, message } the way ApiError is shaped:
+// 401 for a refused credential, 403 for a missing role, 502 when the IdP misbehaves.
+export function createPasswordSignIn(cfg, discovery, deps) {
   const jwks = createJwks(discovery.jwksUri);
-  const callbackUrl = `${deps.baseUrl}/api/auth/oidc/callback`;
-  const secure = deps.baseUrl.startsWith('https');
-
-  app.get('/api/auth/oidc/login', async (req, res, next) => {
+  const fail = (status, message) => Object.assign(new Error(message), { status });
+  return async function signIn(username, password) {
+    const body = new URLSearchParams({
+      grant_type: 'password',
+      client_id: cfg.clientId,
+      client_secret: cfg.clientSecret,
+      username,
+      password,
+      scope: cfg.scopes,
+    });
+    let tr;
     try {
-      const secret = await deps.ensureSessionSecret();
-      const state = b64url(crypto.randomBytes(24));
-      const nonce = b64url(crypto.randomBytes(24));
-      const verifier = b64url(crypto.randomBytes(48));
-      const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());
-      const flow = deps.signSession({ state, nonce, verifier, exp: Date.now() + FLOW_TTL_MS }, secret);
-      res.cookie(OIDC_COOKIE, flow, { httpOnly: true, secure, sameSite: 'lax', maxAge: FLOW_TTL_MS, path: '/api/auth/oidc' });
-      const u = new URL(discovery.authorizationEndpoint);
-      u.searchParams.set('client_id', cfg.clientId);
-      u.searchParams.set('response_type', 'code');
-      u.searchParams.set('scope', cfg.scopes);
-      u.searchParams.set('redirect_uri', callbackUrl);
-      u.searchParams.set('state', state);
-      u.searchParams.set('nonce', nonce);
-      u.searchParams.set('code_challenge', challenge);
-      u.searchParams.set('code_challenge_method', 'S256');
-      res.redirect(302, u.toString());
-    } catch (err) {
-      next(err);
+      tr = await fetch(discovery.tokenEndpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+    } catch (e) {
+      deps.logAuth('oidc', { username, outcome: 'idp_unreachable', error: e.message });
+      throw fail(502, 'the identity provider is unreachable');
     }
-  });
-
-  app.get('/api/auth/oidc/callback', async (req, res, next) => {
-    try {
-      const secret = await deps.ensureSessionSecret();
-      const flow = deps.verifySession(deps.readCookie(req, OIDC_COOKIE), secret);
-      res.clearCookie(OIDC_COOKIE, { path: '/api/auth/oidc' });
-      const { code, state, error, error_description: desc } = req.query;
-      if (error) return res.status(401).type('text/plain').send(`sign-in refused by the identity provider: ${desc || error}`);
-      if (!flow || flow.exp < Date.now() || !state || state !== flow.state) {
-        return res.status(400).type('text/plain').send('sign-in flow expired or state mismatch — start again from the dashboard');
-      }
-      const body = new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: String(code),
-        redirect_uri: callbackUrl,
-        client_id: cfg.clientId,
-        client_secret: cfg.clientSecret,
-        code_verifier: flow.verifier,
-      });
-      const tr = await fetch(discovery.tokenEndpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body,
-      });
-      if (!tr.ok) {
-        deps.logAuth('oidc', { outcome: 'token_error', status: tr.status });
-        return res.status(502).type('text/plain').send('could not exchange the sign-in code with the identity provider');
-      }
-      const tokens = await tr.json();
-      const claims = await verifyIdToken(tokens.id_token, {
-        jwks,
-        issuerClaim: discovery.issuerClaim,
-        clientId: cfg.clientId,
-        nonce: flow.nonce,
-      });
-      const name = principalName(claims);
-      // Keycloak puts realm/client roles in the ACCESS token by default and only adds them to
-      // the id_token when the operator flips a mapper. So when the id_token has no such role,
-      // look in the access token too — but only after checking it is a JWT this issuer signed
-      // (its audience is the resource server's, not ours, so that check is skipped).
-      let roleClaims = claims;
-      if (cfg.requiredRole && !hasRequiredRole(claims, cfg.requiredRole) && typeof tokens.access_token === 'string' && tokens.access_token.split('.').length === 3) {
-        try {
-          roleClaims = await verifyIdToken(tokens.access_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId, requireAudience: false });
-        } catch (e) {
-          deps.logAuth('oidc', { username: name, outcome: 'access_token_unverified', error: e.message });
-        }
-      }
-      if (!hasRequiredRole(roleClaims, cfg.requiredRole)) {
-        deps.logAuth('oidc', { username: name, outcome: 'forbidden' });
-        return res.status(403).type('text/plain').send(`signed in as ${name}, but this account has no "${cfg.requiredRole}" role — ask an administrator`);
-      }
-      await deps.issueSession(res, name, { oidc: true });
-      deps.logAuth('oidc', { username: name, outcome: 'ok' });
-      res.redirect(302, cfg.returnPath);
-    } catch (err) {
-      deps.logAuth('oidc', { outcome: 'error', error: err.message });
-      next(err);
+    if (tr.status === 400 || tr.status === 401) {
+      // invalid_grant covers a wrong password, a disabled user, a required action (e.g.
+      // "verify profile") and a user the client may not see. All of them are "no" here;
+      // the IdP's own reason goes to the log, not to the login form.
+      const detail = await tr.json().catch(() => ({}));
+      deps.logAuth('oidc', { username, outcome: 'refused', error: detail.error_description || detail.error });
+      throw fail(401, 'invalid credentials');
     }
-  });
-
-  // Ends the local session AND the IdP session, otherwise an OIDC-only dashboard signs the
-  // user straight back in on the next load.
-  app.get('/api/auth/oidc/logout', (req, res) => {
-    res.clearCookie(deps.sessionCookie, { path: '/' });
-    if (!discovery.endSessionEndpoint) return res.redirect(302, cfg.returnPath);
-    const u = new URL(discovery.endSessionEndpoint);
-    u.searchParams.set('client_id', cfg.clientId);
-    u.searchParams.set('post_logout_redirect_uri', `${deps.baseUrl}${cfg.returnPath}`);
-    res.redirect(302, u.toString());
-  });
+    if (!tr.ok) {
+      deps.logAuth('oidc', { username, outcome: 'idp_error', status: tr.status });
+      throw fail(502, 'the identity provider answered with an error');
+    }
+    const tokens = await tr.json();
+    const claims = await verifyIdToken(tokens.id_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId });
+    const name = principalName(claims);
+    // Keycloak puts realm/client roles in the ACCESS token by default and only adds them to
+    // the id_token when the operator flips a mapper. When the id_token has no such role,
+    // look in the access token too — after checking it is a JWT this issuer signed (its
+    // audience is the resource server's, not ours, so that check is skipped).
+    let roleClaims = claims;
+    if (cfg.requiredRole && !hasRequiredRole(claims, cfg.requiredRole) && typeof tokens.access_token === 'string' && tokens.access_token.split('.').length === 3) {
+      try {
+        roleClaims = await verifyIdToken(tokens.access_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId, requireAudience: false });
+      } catch (e) {
+        deps.logAuth('oidc', { username: name, outcome: 'access_token_unverified', error: e.message });
+      }
+    }
+    if (!hasRequiredRole(roleClaims, cfg.requiredRole)) {
+      deps.logAuth('oidc', { username: name, outcome: 'forbidden' });
+      throw fail(403, `signed in as ${name}, but this account has no "${cfg.requiredRole}" role — ask an administrator`);
+    }
+    deps.logAuth('oidc', { username: name, outcome: 'ok' });
+    return name;
+  };
 }

@@ -14,7 +14,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 import { createStorage, UnsafeKeyError } from './storage/index.js';
 import { createRateLimiter } from './ratelimit.js';
-import { oidcConfigFromEnv, loadDiscovery, mountOidc } from './oidc.js';
+import { oidcConfigFromEnv, loadDiscovery, createPasswordSignIn } from './oidc.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -162,8 +162,9 @@ const CAP_TOKEN_TTL_MS = Number(process.env.CAP_TOKEN_TTL_DAYS || 30) * 24 * 60 
 const LASTUSED_THROTTLE_MS = 5 * 60 * 1000;
 const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/;
 
-// OIDC sign-in (see oidc.js). When configured, the dashboard signs in through the company
-// IdP and, unless OIDC_ONLY=false, the local username/password form is switched off.
+// Company sign-in (see oidc.js). When configured, the dashboard's own form sends the
+// credentials to the IdP's token endpoint; the browser never leaves the app. Unless
+// OIDC_ONLY=false, the local admin account is not consulted at all.
 const OIDC = oidcConfigFromEnv();
 const OIDC_DISCOVERY = OIDC ? await loadDiscovery(OIDC) : null;
 
@@ -1637,19 +1638,17 @@ app.get('/api/auth/session', (req, res) => {
     needsSetup: !auth.admin && !OIDC,
     oidc: !!OIDC,
     oidcOnly: !!OIDC?.only,
+    signinTitle: OIDC?.signinTitle,
   });
 });
 
-// Local username/password sign-in is off when the operator chose OIDC only. The API key
+// With OIDC there is no local admin to create: the IdP is the account store. The API key
 // paths (Bearer) are untouched: scripts and MCP clients keep working.
 function localAuthEnabled(req, res, next) {
-  if (OIDC?.only) return res.status(403).json({ error: 'local sign-in is disabled; use the identity provider' });
+  if (OIDC?.only) return res.status(403).json({ error: 'local accounts are disabled; sign in with your company account' });
   next();
 }
-if (OIDC) mountOidc(app, OIDC, OIDC_DISCOVERY, {
-  signSession, verifySession, ensureSessionSecret, issueSession, readCookie, logAuth,
-  baseUrl: BASE_URL, sessionCookie: SESSION_COOKIE,
-});
+const oidcSignIn = OIDC ? createPasswordSignIn(OIDC, OIDC_DISCOVERY, { logAuth }) : null;
 
 // One-time admin creation: allowed only while no admin exists.
 app.post('/api/auth/setup', localAuthEnabled, async (req, res, next) => {
@@ -1667,7 +1666,7 @@ app.post('/api/auth/setup', localAuthEnabled, async (req, res, next) => {
   }
 });
 
-app.post('/api/auth/login', localAuthEnabled, async (req, res, next) => {
+app.post('/api/auth/login', async (req, res, next) => {
   try {
     const ip = clientIp(req);
     const gate = loginLimiter.check(ip);
@@ -1677,6 +1676,21 @@ app.post('/api/auth/login', localAuthEnabled, async (req, res, next) => {
       return res.status(429).json({ error: 'too many attempts, try again later' });
     }
     const { username, password } = req.body || {};
+    if (OIDC && typeof username === 'string' && typeof password === 'string' && username && password) {
+      try {
+        const name = await oidcSignIn(username, password);
+        await issueSession(res, name, { oidc: true });
+        return res.json({ username: name });
+      } catch (err) {
+        if (err.status === 401 && !OIDC.only) {
+          // break-glass: fall through to the local admin account
+        } else {
+          if (err.status === 401) loginLimiter.fail(ip);
+          throw new ApiError(err.status || 502, err.message);
+        }
+      }
+    }
+    if (OIDC?.only) throw new ApiError(401, 'invalid credentials');
     if (!auth.admin || auth.admin.username !== username || !(await verifyPassword(password, auth.admin))) {
       loginLimiter.fail(ip);
       logAuth('login', { ip, username: typeof username === 'string' ? username : null, outcome: 'fail' });
