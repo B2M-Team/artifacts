@@ -831,6 +831,8 @@
   // ---- login / setup ----
 
   let SETUP = false; // first-run: no admin exists yet → create one
+  let OIDC = false;  // company sign-in through the IdP is configured (see oidc.js)
+  let SIGNIN_TITLE = '';
   // The BASE_URL the server builds artifact links from, which is not always this page's
   // origin. Filled by loadConfig; the QR dialog shows it.
   let serverBaseUrl = location.origin;
@@ -845,7 +847,7 @@
   function showLock() {
     $('lock').style.display = 'flex';
     $('app').style.display = 'none';
-    $('lockSub').textContent = SETUP ? 'Create the admin account' : 'Sign in';
+    $('lockSub').textContent = SETUP ? 'Create the admin account' : (OIDC ? (SIGNIN_TITLE || 'Sign in with your company account') : 'Sign in');
     $('lockSubmit').textContent = SETUP ? 'Create account' : 'Sign in';
     $('lockPass').setAttribute('autocomplete', SETUP ? 'new-password' : 'current-password');
     $('lockUser').value = '';
@@ -2587,6 +2589,8 @@
       const s = await fetch('/api/auth/session').then((r) => r.json());
       if (s.authenticated) return showApp();
       SETUP = !!s.needsSetup;
+      OIDC = !!s.oidc;
+      SIGNIN_TITLE = s.signinTitle || '';
     } catch {}
     showLock();
   })();

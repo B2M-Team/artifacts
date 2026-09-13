@@ -13,6 +13,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 import { createStorage, UnsafeKeyError } from './storage/index.js';
 import { createRateLimiter } from './ratelimit.js';
+import { oidcConfigFromEnv, loadDiscovery, createPasswordSignIn } from './oidc.js';
 import {
   createAuthStore,
   AdminSeedError,
@@ -96,6 +97,12 @@ const config = await createConfigStore(storage);
 // The single admin account, the managed API keys, and the two HMAC secrets. See
 // lib/auth.js. Every name below is used by the auth routes, the key routes, and the
 // serve-path visibility gate further down this file.
+// Company sign-in (see oidc.js). When configured, the dashboard's own form sends the
+// credentials to the IdP's token endpoint; the browser never leaves the app. Unless
+// OIDC_ONLY=false, the local admin account is not consulted at all.
+const OIDC = oidcConfigFromEnv();
+const OIDC_DISCOVERY = OIDC ? await loadDiscovery(OIDC) : null;
+
 const {
   auth,
   DECOY_ADMIN,
@@ -110,7 +117,7 @@ const {
   requireAdmin,
   signCapToken,
   verifyCapToken,
-} = await createAuthStore(storage, { apiKey: API_KEY, baseUrl: BASE_URL }).catch((err) => {
+} = await createAuthStore(storage, { apiKey: API_KEY, baseUrl: BASE_URL, oidc: !!OIDC }).catch((err) => {
   // An unreadable auth.json or a rejected admin seed is an operator problem with a recovery
   // path, so print the line and stop. Everything else (a storage backend that is down, a bug)
   // keeps its stack.
@@ -2055,11 +2062,28 @@ const unlockLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
 
 // Drives the dashboard's first-run vs login screen. Unauthenticated by design.
 app.get('/api/auth/session', (req, res) => {
-  res.json({ authenticated: !!sessionPrincipal(req), needsSetup: !auth.admin });
+  const principal = sessionPrincipal(req);
+  res.json({
+    authenticated: !!principal,
+    username: principal?.username,
+    // With OIDC the IdP is the account store; there is no local admin to create.
+    needsSetup: !auth.admin && !OIDC,
+    oidc: !!OIDC,
+    oidcOnly: !!OIDC?.only,
+    signinTitle: OIDC?.signinTitle,
+  });
 });
 
+// With OIDC there is no local admin to create. The API key paths (Bearer) are untouched:
+// scripts and MCP clients keep working.
+function localAuthEnabled(req, res, next) {
+  if (OIDC?.only) return res.status(403).json({ error: 'local accounts are disabled; sign in with your company account' });
+  next();
+}
+const oidcSignIn = OIDC ? createPasswordSignIn(OIDC, OIDC_DISCOVERY, { logAuth }) : null;
+
 // One-time admin creation: allowed only while no admin exists.
-app.post('/api/auth/setup', async (req, res, next) => {
+app.post('/api/auth/setup', localAuthEnabled, async (req, res, next) => {
   try {
     if (auth.admin) throw new ApiError(409, 'admin account already exists');
     const { username, password } = req.body || {};
@@ -2092,6 +2116,21 @@ app.post('/api/auth/login', async (req, res, next) => {
       return res.status(429).json({ error: 'too many attempts, try again later' });
     }
     const { username, password } = req.body || {};
+    if (OIDC && typeof username === 'string' && typeof password === 'string' && username && password) {
+      try {
+        const name = await oidcSignIn(username, password);
+        await issueSession(res, name, { oidc: true });
+        return res.json({ username: name });
+      } catch (err) {
+        if (err.status === 401 && !OIDC.only) {
+          // break-glass: fall through to the local admin account
+        } else {
+          if (err.status === 401) loginLimiter.fail(ip);
+          throw new ApiError(err.status || 502, err.message);
+        }
+      }
+    }
+    if (OIDC?.only) throw new ApiError(401, 'invalid credentials');
     // Hash against the decoy when the username does not match, so a wrong username and a
     // wrong password cost the same. `matched` still decides the outcome.
     const matched = !!auth.admin && auth.admin.username === username;
