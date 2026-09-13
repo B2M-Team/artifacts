@@ -492,6 +492,7 @@
     <label for="lockPass">Password</label>
     <input id="lockPass" type="password" autocomplete="current-password">
     <button id="lockSubmit">Sign in</button>
+    <button id="lockSso" type="button" style="display:none">Sign in with SSO</button>
     <div id="lockError"></div>
   </div>
 </div>
@@ -709,6 +710,8 @@
   // ---- login / setup ----
 
   let SETUP = false; // first-run: no admin exists yet → create one
+  let OIDC = false;  // identity-provider sign-in is configured (see oidc.js)
+  let OIDC_ONLY = false;
 
   function showApp() {
     $('lock').style.display = 'none';
@@ -726,7 +729,11 @@
     $('lockUser').value = '';
     $('lockPass').value = '';
     $('lockError').textContent = '';
-    $('lockUser').focus();
+    $('lockSso').style.display = OIDC ? '' : 'none';
+    for (const id of ['lockUser', 'lockPass', 'lockSubmit']) $(id).style.display = OIDC_ONLY ? 'none' : '';
+    for (const el of document.querySelectorAll('#lockCard label')) el.style.display = OIDC_ONLY ? 'none' : '';
+    if (OIDC_ONLY) $('lockSub').textContent = 'Sign in with your company account';
+    if (!OIDC_ONLY) $('lockUser').focus();
   }
 
   function shakeLock() {
@@ -763,7 +770,9 @@
   $('lockSubmit').addEventListener('click', submitAuth);
   $('lockUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('lockPass').focus(); });
   $('lockPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitAuth(); });
+  $('lockSso').addEventListener('click', () => { location.href = '/api/auth/oidc/login'; });
   $('logout').addEventListener('click', async () => {
+    if (OIDC) { location.href = '/api/auth/oidc/logout'; return; }
     try { await fetch('/api/auth/logout', { method: 'POST' }); } catch {}
     SETUP = false;
     showLock();
@@ -1815,6 +1824,8 @@
       const s = await fetch('/api/auth/session').then((r) => r.json());
       if (s.authenticated) return showApp();
       SETUP = !!s.needsSetup;
+      OIDC = !!s.oidc;
+      OIDC_ONLY = !!s.oidcOnly;
     } catch {}
     showLock();
   })();

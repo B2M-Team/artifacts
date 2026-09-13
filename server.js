@@ -14,6 +14,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 import { createStorage, UnsafeKeyError } from './storage/index.js';
 import { createRateLimiter } from './ratelimit.js';
+import { oidcConfigFromEnv, loadDiscovery, mountOidc } from './oidc.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -161,6 +162,11 @@ const CAP_TOKEN_TTL_MS = Number(process.env.CAP_TOKEN_TTL_DAYS || 30) * 24 * 60 
 const LASTUSED_THROTTLE_MS = 5 * 60 * 1000;
 const USERNAME_RE = /^[a-zA-Z0-9._-]{3,32}$/;
 
+// OIDC sign-in (see oidc.js). When configured, the dashboard signs in through the company
+// IdP and, unless OIDC_ONLY=false, the local username/password form is switched off.
+const OIDC = oidcConfigFromEnv();
+const OIDC_DISCOVERY = OIDC ? await loadDiscovery(OIDC) : null;
+
 const ADMIN_USERNAME = process.env.ARTIFACTS_ADMIN_USERNAME;
 const ADMIN_PASSWORD = process.env.ARTIFACTS_ADMIN_PASSWORD;
 
@@ -289,9 +295,9 @@ function readCookie(req, name) {
   return null;
 }
 
-async function issueSession(res, username) {
+async function issueSession(res, username, extra = {}) {
   const secret = await ensureSessionSecret();
-  const token = signSession({ sub: username, exp: Date.now() + SESSION_TTL_MS }, secret);
+  const token = signSession({ sub: username, exp: Date.now() + SESSION_TTL_MS, ...extra }, secret);
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true,
     secure: BASE_URL.startsWith('https'),
@@ -306,8 +312,11 @@ function sessionPrincipal(req) {
   const payload = verifySession(readCookie(req, SESSION_COOKIE), auth.sessionSecret);
   if (!payload) return null;
   if (typeof payload.exp === 'number' && payload.exp <= Date.now()) return null;
+  // An OIDC session is the IdP's word, not the local admin record's: it stays valid
+  // only while OIDC is configured, so unsetting OIDC_ISSUER revokes every such session.
+  if (payload.oidc === true) return OIDC ? { admin: true, scopes: SCOPES, session: true, username: payload.sub, oidc: true } : null;
   if (!auth.admin || payload.sub !== auth.admin.username) return null;
-  return { admin: true, scopes: SCOPES, session: true };
+  return { admin: true, scopes: SCOPES, session: true, username: payload.sub };
 }
 
 function hasScope(scopes, required) {
@@ -1620,11 +1629,30 @@ const unlockLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 10 });
 
 // Drives the dashboard's first-run vs login screen. Unauthenticated by design.
 app.get('/api/auth/session', (req, res) => {
-  res.json({ authenticated: !!sessionPrincipal(req), needsSetup: !auth.admin });
+  const principal = sessionPrincipal(req);
+  res.json({
+    authenticated: !!principal,
+    username: principal?.username,
+    // With OIDC the IdP is the account store; there is no local admin to create.
+    needsSetup: !auth.admin && !OIDC,
+    oidc: !!OIDC,
+    oidcOnly: !!OIDC?.only,
+  });
+});
+
+// Local username/password sign-in is off when the operator chose OIDC only. The API key
+// paths (Bearer) are untouched: scripts and MCP clients keep working.
+function localAuthEnabled(req, res, next) {
+  if (OIDC?.only) return res.status(403).json({ error: 'local sign-in is disabled; use the identity provider' });
+  next();
+}
+if (OIDC) mountOidc(app, OIDC, OIDC_DISCOVERY, {
+  signSession, verifySession, ensureSessionSecret, issueSession, readCookie, logAuth,
+  baseUrl: BASE_URL, sessionCookie: SESSION_COOKIE,
 });
 
 // One-time admin creation: allowed only while no admin exists.
-app.post('/api/auth/setup', async (req, res, next) => {
+app.post('/api/auth/setup', localAuthEnabled, async (req, res, next) => {
   try {
     if (auth.admin) throw new ApiError(409, 'admin account already exists');
     const { username, password } = req.body || {};
@@ -1639,7 +1667,7 @@ app.post('/api/auth/setup', async (req, res, next) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res, next) => {
+app.post('/api/auth/login', localAuthEnabled, async (req, res, next) => {
   try {
     const ip = clientIp(req);
     const gate = loginLimiter.check(ip);
