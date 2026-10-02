@@ -29,6 +29,8 @@
 //   OIDC_SSO_BUTTON       label of the SSO button, default "Sign in with SSO"
 //   OIDC_RETURN_PATH      where the browser lands after the callback, default "/" (behind a path
 //                         rewrite, e.g. "/reports/")
+//   OIDC_ADMIN_ROLE       optional realm/client role whose holders are administrators when OWNER_SCOPING
+//                         is on (see lib/ownership.js); everyone else only sees their own artifacts
 import crypto from 'node:crypto';
 
 export function oidcConfigFromEnv(env = process.env) {
@@ -52,6 +54,8 @@ export function oidcConfigFromEnv(env = process.env) {
     passwordForm: env.OIDC_PASSWORD_FORM === undefined ? true : /^(1|true)$/i.test(env.OIDC_PASSWORD_FORM),
     ssoButton: env.OIDC_SSO_BUTTON || 'Sign in with SSO',
     returnPath: env.OIDC_RETURN_PATH || '/',
+    // A role that lifts owner scoping (OWNER_SCOPING): holders see every artifact. Empty = nobody does.
+    adminRole: env.OIDC_ADMIN_ROLE || '',
   };
 }
 
@@ -175,26 +179,34 @@ const fail = (status, message) => Object.assign(new Error(message), { status });
 async function principalFromTokens(tokens, { cfg, jwks, discovery, deps, nonce, who }) {
   const claims = await verifyIdToken(tokens.id_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId, nonce });
   const name = principalName(claims);
-  let roleClaims = claims;
-  if (cfg.requiredRole && !hasRequiredRole(claims, cfg.requiredRole) && typeof tokens.access_token === 'string' && tokens.access_token.split('.').length === 3) {
-    try {
-      roleClaims = await verifyIdToken(tokens.access_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId, requireAudience: false });
-    } catch (e) {
-      deps.logAuth('oidc', { username: name, outcome: 'access_token_unverified', error: e.message });
+  // The access token is only consulted for a role the id_token lacks, and verified once.
+  let accessClaims;
+  const fromAccessToken = async () => {
+    if (accessClaims !== undefined) return accessClaims;
+    accessClaims = null;
+    if (typeof tokens.access_token === 'string' && tokens.access_token.split('.').length === 3) {
+      try {
+        accessClaims = await verifyIdToken(tokens.access_token, { jwks, issuerClaim: discovery.issuerClaim, clientId: cfg.clientId, requireAudience: false });
+      } catch (e) {
+        deps.logAuth('oidc', { username: name, outcome: 'access_token_unverified', error: e.message });
+      }
     }
-  }
-  if (!hasRequiredRole(roleClaims, cfg.requiredRole)) {
+    return accessClaims;
+  };
+  const holds = async (role) => hasRequiredRole(claims, role) || (!!(await fromAccessToken()) && hasRequiredRole(accessClaims, role));
+  if (cfg.requiredRole && !(await holds(cfg.requiredRole))) {
     deps.logAuth('oidc', { username: name, outcome: 'forbidden', via: who });
     throw fail(403, `signed in as ${name}, but this account has no "${cfg.requiredRole}" role — ask an administrator`);
   }
   deps.logAuth('oidc', { username: name, outcome: 'ok', via: who });
-  return name;
+  // The admin role is read from claims we verified (the access token included), never from anything the browser sent.
+  return { name, isAdmin: !!cfg.adminRole && (await holds(cfg.adminRole)) };
 }
 
 // Exchanges a username/password with the IdP (resource owner password grant) and returns
-// the signed-in principal's name. Throws { status, message } the way ApiError is shaped:
+// the signed-in principal's name (or { name, isAdmin } with { detailed: true }). Throws { status, message } the way ApiError is shaped:
 // 401 for a refused credential, 403 for a missing role, 502 when the IdP misbehaves.
-export function createPasswordSignIn(cfg, discovery, deps) {
+export function createPasswordSignIn(cfg, discovery, deps, { detailed = false } = {}) {
   const jwks = createJwks(discovery.jwksUri);
   return async function signIn(username, password) {
     const body = new URLSearchParams({
@@ -225,7 +237,8 @@ export function createPasswordSignIn(cfg, discovery, deps) {
       throw fail(502, 'the identity provider answered with an error');
     }
     const tokens = await tr.json();
-    return principalFromTokens(tokens, { cfg, jwks, discovery, deps, who: 'password' });
+    const principal = await principalFromTokens(tokens, { cfg, jwks, discovery, deps, who: 'password' });
+    return detailed ? principal : principal.name;
   };
 }
 

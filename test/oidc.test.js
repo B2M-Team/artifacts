@@ -153,8 +153,9 @@ test('finish() redeems the code with the verifier and returns the principal', as
   const { srv, seen, disc } = await stubIdp({ idRoles: ['reports-admin'], nonce: 'N' });
   try {
     const flow = createCodeFlow(cfg, disc, { logAuth: () => {} });
-    const name = await flow.finish({ code: 'good-code', state: 'S' }, { s: 'S', n: 'N', v: 'VERIFIER', exp: Date.now() + 60_000 }, REDIRECT);
+    const { name, isAdmin } = await flow.finish({ code: 'good-code', state: 'S' }, { s: 'S', n: 'N', v: 'VERIFIER', exp: Date.now() + 60_000 }, REDIRECT);
     assert.equal(name, 'tuna');
+    assert.equal(isAdmin, false, 'no OIDC_ADMIN_ROLE configured → nobody is an administrator');
     assert.equal(seen[0].code_verifier, 'VERIFIER');
     assert.equal(seen[0].redirect_uri, REDIRECT, 'byte-identical to the one sent to the authorize endpoint');
     assert.equal(seen[0].client_secret, 's');
@@ -165,7 +166,18 @@ test('the required role is also found in the access token when the id_token lack
   const { srv, disc } = await stubIdp({ idRoles: [], atRoles: ['reports-admin'], nonce: 'N' });
   try {
     const flow = createCodeFlow(cfg, disc, { logAuth: () => {} });
-    assert.equal(await flow.finish({ code: 'good-code', state: 'S' }, { s: 'S', n: 'N', v: 'V', exp: Date.now() + 60_000 }, REDIRECT), 'tuna');
+    assert.equal((await flow.finish({ code: 'good-code', state: 'S' }, { s: 'S', n: 'N', v: 'V', exp: Date.now() + 60_000 }, REDIRECT)).name, 'tuna');
+  } finally { srv.close(); }
+});
+
+test('OIDC_ADMIN_ROLE marks an administrator, read from the verified access token too', async () => {
+  const { srv, disc } = await stubIdp({ idRoles: ['reports-admin'], atRoles: ['reports-admin', 'platform-admin'], nonce: 'N' });
+  try {
+    const live = () => ({ s: 'S', n: 'N', v: 'V', exp: Date.now() + 60_000 });
+    const admin = createCodeFlow({ ...cfg, adminRole: 'platform-admin' }, disc, { logAuth: () => {} });
+    assert.equal((await admin.finish({ code: 'good-code', state: 'S' }, live(), REDIRECT)).isAdmin, true);
+    const other = createCodeFlow({ ...cfg, adminRole: 'some-other-role' }, disc, { logAuth: () => {} });
+    assert.equal((await other.finish({ code: 'good-code', state: 'S' }, live(), REDIRECT)).isAdmin, false);
   } finally { srv.close(); }
 });
 
