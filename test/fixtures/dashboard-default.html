@@ -850,6 +850,7 @@
   let SSO_BUTTON = '';
   let PASSWORD_FORM = true;   // the username/password form stays next to it
   let REQUIRED_ROLE = '';
+  let SCOPED = false;         // owner scoping is on and this session sees only its own artifacts
   // The BASE_URL the server builds artifact links from, which is not always this page's
   // origin. Filled by loadConfig; the QR dialog shows it.
   let serverBaseUrl = location.origin;
@@ -1462,6 +1463,7 @@
       // not just truthy: a hand-edited numeric target would throw here and take the list with it.
       || (typeof a.target === 'string' && a.target.toLowerCase().includes(q))
       || (a.project && a.project.toLowerCase().includes(q))
+      || (typeof a.owner === 'string' && a.owner.toLowerCase().includes(q))
       || (a.tags || []).some((t) => t.toLowerCase().includes(q));
   }
 
@@ -1896,6 +1898,16 @@
         pt.title = 'Filter to project “' + a.project + '”';
         pt.addEventListener('click', () => { $('search').value = a.project; renderList(); });
         meta.appendChild(pt);
+      }
+      // Whose it is, for the people who see everyone's (administrators, or an instance with scoping off). A scoped
+      // user only ever sees their own, so the badge would be noise.
+      if (a.owner && !SCOPED) {
+        const ow = document.createElement('button');
+        ow.className = 'chip owner';
+        ow.textContent = a.owner;
+        ow.title = 'Owner — click to filter to ' + a.owner;
+        ow.addEventListener('click', () => { $('search').value = a.owner; renderList(); });
+        meta.appendChild(ow);
       }
       for (const t of a.tags || []) {
         const chip = document.createElement('button');
@@ -2614,6 +2626,7 @@
   (async () => {
     try {
       const s = await fetch('/api/auth/session').then((r) => r.json());
+      SCOPED = !!s.scoped;
       if (s.authenticated) return showApp();
       SETUP = !!s.needsSetup;
       OIDC = !!s.oidc;

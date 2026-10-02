@@ -34,6 +34,7 @@ import {
 } from './lib/auth.js';
 import { SOURCE_EXT, dropOrphanObjects, dropStaleObjects } from './lib/artifact-files.js';
 import { createConfigStore } from './lib/config.js';
+import { ownerScopingEnabled, scopeOf, canAccess, ownerForNew, cleanOwner, OWNER_RE, MCP_TOOL_GUARDS } from './lib/ownership.js';
 import { ApiError, clientFacingError } from './lib/errors.js';
 import { createWriteQueue, WRITE_CEILING_MS } from './lib/write-queue.js';
 import { artifactExpired } from './lib/expiry.js';
@@ -102,6 +103,26 @@ const config = await createConfigStore(storage);
 // OIDC_ONLY=false, the local admin account is not consulted at all.
 const OIDC = oidcConfigFromEnv();
 const OIDC_DISCOVERY = OIDC ? await loadDiscovery(OIDC) : null;
+
+// Owner scoping (lib/ownership.js). Off unless OWNER_SCOPING=true.
+const OWNER_SCOPING = ownerScopingEnabled();
+const scopeFor = (principal) => scopeOf(principal, OWNER_SCOPING);
+// Not-owned reads as not-found, the way a private artifact does: a scoped caller learns nothing
+// about other people's slugs from the status code.
+async function assertOwned(principal, slug) {
+  const scope = scopeFor(principal);
+  if (!scope.scoped) return;
+  const meta = SLUG_RE.test(slug) ? await readMeta(slug) : null;
+  if (!meta || !canAccess(scope, meta)) throw new ApiError(404, `slug "${slug}" not found`);
+}
+// Who a NEW artifact belongs to: the principal if it is scoped, else the (trusted) X-Artifacts-Owner header.
+const newOwner = (principal, req) => ownerForNew(scopeFor(principal), req?.headers?.['x-artifacts-owner']);
+// Global settings, keys and the backfill are for unscoped principals only; otherwise a scoped user
+// could mint an owner-less key (which is unscoped) and walk around every other check.
+function requireUnscoped(req, res, next) {
+  if (scopeFor(req.principal).scoped) return res.status(403).json({ error: 'forbidden: administrators only' });
+  next();
+}
 
 const {
   auth,
@@ -617,16 +638,16 @@ function extractSiteFiles(zip) {
 // Chained on the target slug like every other write: the 409 below is a read followed by a
 // write, so a zip deploy and an inline publish naming one slug both used to answer 201 and the
 // loser's bytes stayed on disk with nothing serving them.
-async function saveZipArtifact(buffer, input) {
+async function saveZipArtifact(buffer, input, owner) {
   const wanted = wantedSlug(input.slug);
   if (wanted !== undefined && !SLUG_RE.test(wanted)) {
     throw new ApiError(400, 'slug must match [a-z0-9][a-z0-9-]{2,63}');
   }
   const finalSlug = wanted || nanoid();
-  return withMetaChain(finalSlug, () => storeZipArtifact(buffer, finalSlug, input));
+  return withMetaChain(finalSlug, () => storeZipArtifact(buffer, finalSlug, input, owner));
 }
 
-async function storeZipArtifact(buffer, finalSlug, { title, description, ogImage, expiresAt, tags, project, visibility, password }) {
+async function storeZipArtifact(buffer, finalSlug, { title, description, ogImage, expiresAt, tags, project, visibility, password }, owner) {
   const expiry = expiresAt !== undefined ? parseExpiresAt(expiresAt) : undefined;
   const tagList = tags !== undefined ? parseTags(tags) : undefined;
   const projectName = project !== undefined ? parseProject(project) : undefined;
@@ -664,6 +685,7 @@ async function storeZipArtifact(buffer, finalSlug, { title, description, ogImage
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+  if (owner) meta.owner = owner;
   if (expiry !== undefined) meta.expiresAt = expiry;
   if (tagList?.length) meta.tags = tagList;
   if (projectName) meta.project = projectName;
@@ -781,7 +803,7 @@ async function saveArtifact(input, opts = {}) {
   return withMetaChain(finalSlug, () => storeArtifact(finalSlug, input, opts));
 }
 
-async function storeArtifact(finalSlug, input, { replace = false, keyId = null } = {}) {
+async function storeArtifact(finalSlug, input, { replace = false, keyId = null, owner } = {}) {
   const { content, type = 'html', title, description, ogImage, expiresAt, frame, tags, project, visibility, password, pdf } = input;
   if (typeof content !== 'string' || !content.trim()) {
     throw new ApiError(400, 'content (non-empty string) is required');
@@ -869,6 +891,8 @@ async function storeArtifact(finalSlug, input, { replace = false, keyId = null }
     createdAt: existing?.createdAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+  // The owner is set once, from the authenticated principal (never from `input`), and a replace keeps it.
+  if (owner && !existing?.owner) meta.owner = owner;
   // The target lives in source.url, which the list API never reads, so a redirect also
   // carries it in meta for the dashboard row. Cleared on any other type, or an artifact
   // converted away from redirect would keep claiming a destination it no longer has.
@@ -944,7 +968,7 @@ async function storeArtifact(finalSlug, input, { replace = false, keyId = null }
 // the request body when provided, else inherits the source's value, so a copy keeps all of
 // the original's setup unless the caller overrides it. The view password cannot be inherited
 // (stored hashed), so a password-visibility copy requires a new password in the body.
-async function duplicateArtifact(sourceSlug, body = {}, { keyId = null } = {}) {
+async function duplicateArtifact(sourceSlug, body = {}, { keyId = null, owner } = {}) {
   if (!SLUG_RE.test(sourceSlug)) throw new ApiError(404, `slug "${sourceSlug}" not found`);
   // Validated after the fallback, the way it always was here: an empty or absent slug on a copy
   // means "pick one", where the same value on a publish is a 400.
@@ -954,10 +978,10 @@ async function duplicateArtifact(sourceSlug, body = {}, { keyId = null } = {}) {
   }
   // Both names: the target because the 409 below is a read-then-write, and the source because
   // copySlug walks its directory while a PATCH there may be renaming a scratch file into place.
-  return withMetaChains([sourceSlug, targetSlug], () => copyArtifact(sourceSlug, targetSlug, body, keyId));
+  return withMetaChains([sourceSlug, targetSlug], () => copyArtifact(sourceSlug, targetSlug, body, keyId, owner));
 }
 
-async function copyArtifact(sourceSlug, targetSlug, body, keyId) {
+async function copyArtifact(sourceSlug, targetSlug, body, keyId, owner) {
   const source = await readMeta(sourceSlug);
   if (!source) throw new ApiError(404, `slug "${sourceSlug}" not found`);
   if (await readMeta(targetSlug)) {
@@ -1063,6 +1087,8 @@ async function copyArtifact(sourceSlug, targetSlug, body, keyId) {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
+  // A copy belongs to whoever made it, not to the original's owner.
+  if (owner) meta.owner = owner;
   if (source.type === 'zip' && typeof source.files === 'number') meta.files = source.files;
   if (source.type === 'redirect') {
     meta.target = copiedTarget;
@@ -1110,7 +1136,7 @@ function seedTokenEpoch(meta) {
 // (tokenEpoch) are dropped, and hasPassword exposes state without the hash.
 const PUBLIC_META_FIELDS = [
   'slug', 'type', 'title', 'files', 'target', 'description', 'ogImage', 'createdAt', 'updatedAt',
-  'expiresAt', 'frame', 'tags', 'project', 'visibility', 'disabled', 'pdf',
+  'expiresAt', 'frame', 'tags', 'project', 'visibility', 'disabled', 'pdf', 'owner',
 ];
 function publicMeta(meta) {
   const out = {};
@@ -1135,8 +1161,9 @@ async function listArtifactMetas() {
     .filter(Boolean);
 }
 
-async function listArtifacts({ tag, project } = {}) {
+async function listArtifacts({ tag, project, scope } = {}) {
   let items = (await listArtifactMetas())
+    .filter((m) => !scope || canAccess(scope, m))
     .map((m) => ({ ...publicMeta(m), tags: m.tags || [] }))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   if (tag !== undefined) {
@@ -1903,7 +1930,7 @@ app.post('/a/:slug/unlock', async (req, res, next) => {
 
 app.post('/api/artifacts', requireAuth('publish'), async (req, res, next) => {
   try {
-    res.status(201).json(await saveArtifact(req.body, { keyId: req.principal.keyId }));
+    res.status(201).json(await saveArtifact(req.body, { keyId: req.principal.keyId, owner: newOwner(req.principal, req) }));
   } catch (err) {
     next(err);
   }
@@ -1920,7 +1947,7 @@ app.post('/api/artifacts/zip', requireAuth('publish'), zipBody, async (req, res,
       throw new ApiError(400, 'raw zip body required (Content-Type: application/zip)');
     }
     const { slug, title, description, ogImage, expiresAt, tags, project, visibility, password } = req.query;
-    res.status(201).json(await saveZipArtifact(req.body, { slug, title, description, ogImage, expiresAt, tags, project, visibility, password }));
+    res.status(201).json(await saveZipArtifact(req.body, { slug, title, description, ogImage, expiresAt, tags, project, visibility, password }, newOwner(req.principal, req)));
   } catch (err) {
     next(err);
   }
@@ -1928,7 +1955,9 @@ app.post('/api/artifacts/zip', requireAuth('publish'), zipBody, async (req, res,
 
 app.put('/api/artifacts/:slug', requireAuth('publish'), async (req, res, next) => {
   try {
-    res.json(await saveArtifact({ ...req.body, slug: req.params.slug }, { replace: true, keyId: req.principal.keyId }));
+    // A PUT creates when the slug is free, replaces when it is the caller's, and is a 404 for anyone else's.
+    if (scopeFor(req.principal).scoped && SLUG_RE.test(req.params.slug) && (await readMeta(req.params.slug))) await assertOwned(req.principal, req.params.slug);
+    res.json(await saveArtifact({ ...req.body, slug: req.params.slug }, { replace: true, keyId: req.principal.keyId, owner: newOwner(req.principal, req) }));
   } catch (err) {
     next(err);
   }
@@ -1936,6 +1965,7 @@ app.put('/api/artifacts/:slug', requireAuth('publish'), async (req, res, next) =
 
 app.patch('/api/artifacts/:slug', requireAuth('publish'), async (req, res, next) => {
   try {
+    await assertOwned(req.principal, req.params.slug);
     res.json(await patchArtifact(req.params.slug, req.body));
   } catch (err) {
     next(err);
@@ -1944,6 +1974,7 @@ app.patch('/api/artifacts/:slug', requireAuth('publish'), async (req, res, next)
 
 app.delete('/api/artifacts/:slug', requireAuth('full'), async (req, res, next) => {
   try {
+    await assertOwned(req.principal, req.params.slug);
     await deleteArtifact(req.params.slug);
     res.json({ deleted: req.params.slug });
   } catch (err) {
@@ -1957,7 +1988,7 @@ app.delete('/api/artifacts/:slug', requireAuth('full'), async (req, res, next) =
 app.get('/api/artifacts/:slug/link', requireAuth('read'), async (req, res, next) => {
   try {
     const meta = SLUG_RE.test(req.params.slug) ? await readMeta(req.params.slug) : null;
-    if (!meta) throw new ApiError(404, `slug "${req.params.slug}" not found`);
+    if (!meta || !canAccess(scopeFor(req.principal), meta)) throw new ApiError(404, `slug "${req.params.slug}" not found`);
     // A lapsed artifact mints nothing. Every serve path answers 410 or 404 for it, so a token
     // handed out here is a link the operator believes works and the recipient cannot open.
     if (isExpired(meta)) throw new ApiError(410, 'artifact expired');
@@ -1976,7 +2007,7 @@ app.get('/api/artifacts/:slug/qr', requireAuth('read'), async (req, res, next) =
   try {
     const { slug } = req.params;
     const meta = SLUG_RE.test(slug) ? await readMeta(slug) : null;
-    if (!meta) throw new ApiError(404, `slug "${slug}" not found`);
+    if (!meta || !canAccess(scopeFor(req.principal), meta)) throw new ApiError(404, `slug "${slug}" not found`);
 
     const raw = req.query.format;
     const format = raw === undefined || raw === '' ? 'svg' : raw;
@@ -2012,7 +2043,8 @@ app.get('/api/artifacts/:slug/qr', requireAuth('read'), async (req, res, next) =
 
 app.post('/api/artifacts/:slug/duplicate', requireAuth('publish'), async (req, res, next) => {
   try {
-    res.status(201).json(await duplicateArtifact(req.params.slug, req.body, { keyId: req.principal.keyId }));
+    await assertOwned(req.principal, req.params.slug);
+    res.status(201).json(await duplicateArtifact(req.params.slug, req.body, { keyId: req.principal.keyId, owner: newOwner(req.principal, req) }));
   } catch (err) {
     next(err);
   }
@@ -2024,6 +2056,7 @@ app.get('/api/artifacts', requireAuth('read'), async (req, res, next) => {
     const opts = {};
     if (typeof tag === 'string' && tag !== '') opts.tag = tag;
     if (typeof project === 'string' && project !== '') opts.project = project;
+    opts.scope = scopeFor(req.principal);
     res.json(await listArtifacts(opts));
   } catch (err) {
     next(err);
@@ -2038,7 +2071,7 @@ app.get('/api/config', requireAuth('read'), (req, res) => {
   res.json({ ...config.current, baseUrl: BASE_URL });
 });
 
-app.put('/api/config', requireAuth('full'), async (req, res, next) => {
+app.put('/api/config', requireAuth('full'), requireUnscoped, async (req, res, next) => {
   try {
     const saved = await config.update(req.body);
     // The dashboard shell is cached with the branding already filled in, so a save has to drop
@@ -2077,6 +2110,10 @@ app.get('/api/auth/session', (req, res) => {
     ssoButton: OIDC?.ssoButton,
     passwordForm: OIDC ? OIDC.passwordForm : true,
     requiredRole: OIDC?.requiredRole || '',
+    // Owner scoping: who this session is, and whether it sees only its own artifacts.
+    owner: principal?.username,
+    scoping: OWNER_SCOPING,
+    scoped: !!principal && scopeFor(principal).scoped,
   });
 });
 
@@ -2086,7 +2123,7 @@ function localAuthEnabled(req, res, next) {
   if (OIDC?.only) return res.status(403).json({ error: 'local accounts are disabled; sign in with your company account' });
   next();
 }
-const oidcSignIn = OIDC ? createPasswordSignIn(OIDC, OIDC_DISCOVERY, { logAuth }) : null;
+const oidcSignIn = OIDC ? createPasswordSignIn(OIDC, OIDC_DISCOVERY, { logAuth }, { detailed: true }) : null;
 
 // "Sign in with SSO": authorization code + PKCE (oidc.js). The flow's state/nonce/verifier
 // ride in a signed, ten-minute cookie. SameSite=Lax, not Strict like the session cookie: the
@@ -2126,8 +2163,8 @@ app.get('/api/auth/oidc/callback', async (req, res) => {
     }
     const secret = await ensureSessionSecret();
     const flow = verifySession(readCookie(req, OIDC_FLOW_COOKIE), secret);
-    const name = await oidcFlow.finish({ code: req.query.code, state: req.query.state }, flow?.typ === 'oidc-flow' ? flow : null, OIDC_CALLBACK);
-    await issueSession(res, name, { oidc: true });
+    const { name, isAdmin } = await oidcFlow.finish({ code: req.query.code, state: req.query.state }, flow?.typ === 'oidc-flow' ? flow : null, OIDC_CALLBACK);
+    await issueSession(res, name, { oidc: true, adm: isAdmin });
     return res.redirect(302, OIDC.returnPath);
   } catch (err) {
     if (err.status === 401) loginLimiter.fail(ip);
@@ -2173,8 +2210,8 @@ app.post('/api/auth/login', async (req, res, next) => {
     const { username, password } = req.body || {};
     if (OIDC && typeof username === 'string' && typeof password === 'string' && username && password) {
       try {
-        const name = await oidcSignIn(username, password);
-        await issueSession(res, name, { oidc: true });
+        const { name, isAdmin } = await oidcSignIn(username, password);
+        await issueSession(res, name, { oidc: true, adm: isAdmin });
         return res.json({ username: name });
       } catch (err) {
         if (err.status === 401 && !OIDC.only) {
@@ -2221,7 +2258,18 @@ app.post('/api/auth/logout', async (req, res, next) => {
     // still answers 200 and writes nothing, so the route cannot be used to sign the operator
     // out, and a browser whose cookie already lapsed keeps getting the answer it expects.
     const principal = sessionPrincipal(req);
-    if (principal) {
+    if (principal?.oidc) {
+      // A company account signs out itself. Rotating adminSecret here would also sign out every
+      // other person using the dashboard (and the single local admin), so record the moment instead:
+      // this user's older cookies stop working, nobody else's do.
+      const who = String(principal.username).toLowerCase();
+      const now = Date.now();
+      await update((a) => {
+        const keep = Object.fromEntries(Object.entries(a.revoked || {}).filter(([, t]) => typeof t === 'number' && now - t < 31 * 24 * 60 * 60 * 1000));
+        a.revoked = { ...keep, [who]: now };
+      });
+      logAuth('logout', { ip: clientIp(req), username: principal.username, outcome: 'user sessions revoked' });
+    } else if (principal) {
       const rotated = crypto.randomBytes(32).toString('hex');
       await update((a) => {
         a.adminSecret = rotated;
@@ -2273,8 +2321,51 @@ app.post('/api/auth/password', requireSession, async (req, res, next) => {
   }
 });
 
+// Owner backfill for artifacts published before scoping. Unscoped principals only, and a DRY RUN unless
+// `dryRun: false` is sent, so the mapping can be read before anything changes. `assign` ({ slug: owner })
+// wins; with `fromProject` (default true) an unowned artifact whose project label is a valid owner name takes it
+// — a one-time migration for labels a trusted publisher set, not something the request path ever derives.
+app.post('/api/owners/backfill', requireAdmin, requireUnscoped, async (req, res, next) => {
+  try {
+    const { dryRun = true, fromProject = true, assign = {} } = req.body || {};
+    if (assign === null || typeof assign !== 'object' || Array.isArray(assign)) throw new ApiError(400, 'assign must be an object of slug -> owner');
+    const rows = [];
+    for (const m of (await listArtifactMetas()).sort((a, b) => String(a.slug).localeCompare(String(b.slug)))) {
+      let proposed = null;
+      if (!m.owner) {
+        if (typeof assign[m.slug] === 'string') {
+          try {
+            proposed = cleanOwner(assign[m.slug]);
+          } catch (e) {
+            throw new ApiError(400, `assign[${m.slug}]: ${e.message}`);
+          }
+        } else if (fromProject && typeof m.project === 'string' && OWNER_RE.test(m.project.trim())) {
+          proposed = m.project.trim();
+        }
+      }
+      rows.push({ slug: m.slug, title: m.title, project: m.project || null, owner: m.owner || null, proposedOwner: proposed, applied: false });
+    }
+    if (dryRun === false) {
+      for (const row of rows) {
+        if (!row.proposedOwner) continue;
+        await withMetaChain(row.slug, async () => {
+          const meta = await readMeta(row.slug);
+          if (!meta || meta.owner) return; // changed since the list
+          meta.owner = row.proposedOwner;
+          await storage.put(`${row.slug}/meta.json`, JSON.stringify(meta, null, 2), { contentType: 'application/json' });
+          row.applied = true;
+        });
+      }
+      await storage.flush?.();
+    }
+    res.json({ dryRun: dryRun !== false, scoping: OWNER_SCOPING, unowned: rows.filter((r) => !r.owner && !r.applied).length, rows });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Managed API keys — admin session or bootstrap admin bearer only.
-app.get('/api/keys', requireAdmin, async (req, res, next) => {
+app.get('/api/keys', requireAdmin, requireUnscoped, async (req, res, next) => {
   try {
     // An entry with no id (a null or a bare string left by a hand edit) cannot be addressed by
     // PATCH or DELETE, so listing it would draw a row whose buttons do nothing. Those are named
@@ -2293,10 +2384,16 @@ app.get('/api/keys', requireAdmin, async (req, res, next) => {
   }
 });
 
-app.post('/api/keys', requireAdmin, async (req, res, next) => {
+app.post('/api/keys', requireAdmin, requireUnscoped, async (req, res, next) => {
   try {
-    const { name, scopes, expiresAt } = req.body || {};
+    const { name, scopes, expiresAt, owner } = req.body || {};
     const parsed = parseKeyInput(name, scopes, expiresAt);
+    let keyOwner;
+    try {
+      keyOwner = owner === undefined || owner === null || owner === '' ? undefined : cleanOwner(owner);
+    } catch (e) {
+      throw new ApiError(400, e.message);
+    }
     const token = 'ah_' + crypto.randomBytes(24).toString('hex');
     const record = {
       id: nanoid(),
@@ -2308,6 +2405,7 @@ app.post('/api/keys', requireAdmin, async (req, res, next) => {
       expiresAt: parsed.expiresAt,
       lastUsedAt: null,
       disabled: false,
+      ...(keyOwner ? { owner: keyOwner } : {}),
     };
     await update((a) => {
       a.keys.push(record);
@@ -2321,7 +2419,7 @@ app.post('/api/keys', requireAdmin, async (req, res, next) => {
   }
 });
 
-app.patch('/api/keys/:id', requireAdmin, async (req, res, next) => {
+app.patch('/api/keys/:id', requireAdmin, requireUnscoped, async (req, res, next) => {
   try {
     // k?.id, not k.id: a null or string entry in the array throws on property access and takes
     // the whole route down with a 500, whichever key is being patched.
@@ -2329,6 +2427,17 @@ app.patch('/api/keys/:id', requireAdmin, async (req, res, next) => {
       const key = a.keys.find((k) => k?.id === req.params.id);
       if (!key) throw new ApiError(404, 'key not found');
       if (typeof req.body?.disabled === 'boolean') key.disabled = req.body.disabled;
+      // owner: a name scopes the key to that owner's artifacts; null/'' makes it unscoped again.
+      if (req.body && 'owner' in req.body) {
+        if (req.body.owner === null || req.body.owner === '') delete key.owner;
+        else {
+          try {
+            key.owner = cleanOwner(req.body.owner);
+          } catch (e) {
+            throw new ApiError(400, e.message);
+          }
+        }
+      }
       return publicKey(key);
     });
     res.json(updated);
@@ -2337,7 +2446,7 @@ app.patch('/api/keys/:id', requireAdmin, async (req, res, next) => {
   }
 });
 
-app.delete('/api/keys/:id', requireAdmin, async (req, res, next) => {
+app.delete('/api/keys/:id', requireAdmin, requireUnscoped, async (req, res, next) => {
   try {
     await update((a) => {
       const idx = a.keys.findIndex((k) => k?.id === req.params.id);
@@ -2356,8 +2465,21 @@ app.delete('/api/keys/:id', requireAdmin, async (req, res, next) => {
 
 // `keyId` names the managed key that authenticated /mcp, so a redirect published through a
 // tool is counted against the same key a REST publish would be. Null for the bootstrap key.
-function createMcpServer(scopes = SCOPES, keyId = null) {
+function createMcpServer(scopes = SCOPES, keyId = null, ctx = { principal: null, req: null }) {
   const server = new McpServer({ name: 'artifacts-host', version: VERSION });
+
+  // Owner scoping for every tool that takes a slug, done once here instead of in twelve handlers. A tool
+  // missing from MCP_TOOL_GUARDS (lib/ownership.js) does not register: a new upstream tool fails closed.
+  const registerTool = server.registerTool.bind(server);
+  server.registerTool = (name, config, handler) => {
+    const kind = MCP_TOOL_GUARDS[name];
+    if (!kind) throw new Error(`MCP tool "${name}" has no ownership class in lib/ownership.js`);
+    if (kind !== 'slug') return registerTool(name, config, handler);
+    return registerTool(name, config, async (args, extra) => {
+      await assertOwned(ctx.principal, args.slug);
+      return handler(args, extra);
+    });
+  };
 
   // Per-tool scope gate — the key that authenticated /mcp carries a scope; a
   // read-only key can list but not mutate, delete needs full. A thrown Error
@@ -2418,7 +2540,7 @@ function createMcpServer(scopes = SCOPES, keyId = null) {
     },
     async (args) => {
       requireScope('publish');
-      const { url } = await saveArtifact(args, { keyId });
+      const { url } = await saveArtifact(args, { keyId, owner: newOwner(ctx.principal, ctx.req) });
       return { content: [{ type: 'text', text: url }] };
     },
   );
@@ -2650,6 +2772,7 @@ function createMcpServer(scopes = SCOPES, keyId = null) {
       const opts = {};
       if (tag) opts.tag = tag;
       if (project) opts.project = project;
+      opts.scope = scopeFor(ctx.principal);
       const items = await listArtifacts(opts);
       return { content: [{ type: 'text', text: JSON.stringify(items, null, 2) }] };
     },
@@ -2674,7 +2797,7 @@ function createMcpServer(scopes = SCOPES, keyId = null) {
 
 app.post('/mcp', requireApiKey('read'), async (req, res) => {
   try {
-    const server = createMcpServer(req.principal.scopes, req.principal.keyId);
+    const server = createMcpServer(req.principal.scopes, req.principal.keyId, { principal: req.principal, req });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on('close', () => {
       transport.close();
