@@ -13,7 +13,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 
 import { createStorage, UnsafeKeyError } from './storage/index.js';
 import { createRateLimiter } from './ratelimit.js';
-import { oidcConfigFromEnv, loadDiscovery, createPasswordSignIn } from './oidc.js';
+import { oidcConfigFromEnv, loadDiscovery, createPasswordSignIn, createCodeFlow } from './oidc.js';
 import {
   createAuthStore,
   AdminSeedError,
@@ -2071,6 +2071,12 @@ app.get('/api/auth/session', (req, res) => {
     oidc: !!OIDC,
     oidcOnly: !!OIDC?.only,
     signinTitle: OIDC?.signinTitle,
+    // The "Sign in with SSO" button (authorization-code flow), and whether the password form
+    // stays next to it. requiredRole lets the dashboard name the role in a "forbidden" message.
+    sso: !!OIDC,
+    ssoButton: OIDC?.ssoButton,
+    passwordForm: OIDC ? OIDC.passwordForm : true,
+    requiredRole: OIDC?.requiredRole || '',
   });
 });
 
@@ -2081,6 +2087,54 @@ function localAuthEnabled(req, res, next) {
   next();
 }
 const oidcSignIn = OIDC ? createPasswordSignIn(OIDC, OIDC_DISCOVERY, { logAuth }) : null;
+
+// "Sign in with SSO": authorization code + PKCE (oidc.js). The flow's state/nonce/verifier
+// ride in a signed, ten-minute cookie. SameSite=Lax, not Strict like the session cookie: the
+// callback is a top-level navigation arriving FROM the IdP, and Strict would drop the cookie.
+const oidcFlow = OIDC ? createCodeFlow(OIDC, OIDC_DISCOVERY, { logAuth }) : null;
+const OIDC_CALLBACK = `${BASE_URL}/api/auth/oidc/callback`;
+const OIDC_FLOW_COOKIE = 'artifacts_oidc';
+const OIDC_FLOW_COOKIE_OPTS = { httpOnly: true, secure: BASE_URL.startsWith('https'), sameSite: 'lax', path: '/api/auth/oidc' };
+
+app.get('/api/auth/oidc/start', async (req, res, next) => {
+  try {
+    if (!oidcFlow) throw new ApiError(404, 'company sign-in is not configured');
+    const { url, flow } = oidcFlow.start(OIDC_CALLBACK);
+    const secret = await ensureSessionSecret();
+    res.cookie(OIDC_FLOW_COOKIE, signSession({ typ: 'oidc-flow', ...flow }, secret), { ...OIDC_FLOW_COOKIE_OPTS, maxAge: 10 * 60 * 1000 });
+    res.set('Cache-Control', 'no-store');
+    res.redirect(302, url);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Every outcome ends on the dashboard: success with the session cookie, failure with
+// ?signin_error=<code> (a fixed vocabulary, never the IdP's text). The flow cookie is cleared
+// either way, so a code can be redeemed once.
+app.get('/api/auth/oidc/callback', async (req, res) => {
+  const ip = clientIp(req);
+  res.set('Cache-Control', 'no-store');
+  res.clearCookie(OIDC_FLOW_COOKIE, OIDC_FLOW_COOKIE_OPTS);
+  if (!oidcFlow) return res.status(404).json({ error: 'company sign-in is not configured' });
+  const back = (code) => res.redirect(302, `${OIDC.returnPath}${OIDC.returnPath.includes('?') ? '&' : '?'}signin_error=${code}`);
+  try {
+    if (loginLimiter.check(ip).limited) return back('ratelimited');
+    if (req.query.error) {
+      logAuth('oidc', { ip, outcome: 'denied', error: String(req.query.error).slice(0, 80), via: 'code' });
+      return back('denied');
+    }
+    const secret = await ensureSessionSecret();
+    const flow = verifySession(readCookie(req, OIDC_FLOW_COOKIE), secret);
+    const name = await oidcFlow.finish({ code: req.query.code, state: req.query.state }, flow?.typ === 'oidc-flow' ? flow : null, OIDC_CALLBACK);
+    await issueSession(res, name, { oidc: true });
+    return res.redirect(302, OIDC.returnPath);
+  } catch (err) {
+    if (err.status === 401) loginLimiter.fail(ip);
+    logAuth('oidc', { ip, outcome: 'callback_failed', status: err.status, error: err.message, via: 'code' });
+    return back(err.status === 403 ? 'forbidden' : err.status === 502 ? 'idp' : 'failed');
+  }
+});
 
 // One-time admin creation: allowed only while no admin exists.
 app.post('/api/auth/setup', localAuthEnabled, async (req, res, next) => {
@@ -2115,6 +2169,7 @@ app.post('/api/auth/login', async (req, res, next) => {
       res.set('Retry-After', String(gate.retryAfter));
       return res.status(429).json({ error: 'too many attempts, try again later' });
     }
+    if (OIDC && !OIDC.passwordForm) throw new ApiError(403, 'password sign-in is disabled; use SSO');
     const { username, password } = req.body || {};
     if (OIDC && typeof username === 'string' && typeof password === 'string' && username && password) {
       try {
@@ -2175,7 +2230,16 @@ app.post('/api/auth/logout', async (req, res, next) => {
       // operator asking why their phone dropped its session has nothing to read.
       logAuth('logout', { ip: clientIp(req), outcome: 'sessions revoked' });
     }
-    res.json({ ok: true });
+    // A company sign-in session also ends the IdP's SSO session: the dashboard sends the browser
+    // to the end-session URL, which returns to the dashboard (the post-logout URI is registered on
+    // the client). Without it the next "Sign in with SSO" would sign straight back in.
+    let endSessionUrl = null;
+    if (principal?.oidc && OIDC_DISCOVERY?.endSessionEndpoint) {
+      const u = new URL(OIDC_DISCOVERY.endSessionEndpoint);
+      u.search = new URLSearchParams({ client_id: OIDC.clientId, post_logout_redirect_uri: `${BASE_URL}${OIDC.returnPath}` }).toString();
+      endSessionUrl = u.toString();
+    }
+    res.json({ ok: true, endSessionUrl });
   } catch (err) {
     next(err);
   }

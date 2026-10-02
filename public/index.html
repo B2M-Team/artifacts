@@ -120,6 +120,15 @@
   }
   #lock input { width: 100%; margin-bottom: 12px; }
   #lock button { width: 100%; }
+  #lock [hidden] { display: none !important; }
+  #lock .ssobtn {
+    display: block; padding: 10px 18px; margin-bottom: 14px; border-radius: var(--r-md);
+    background: var(--molten); color: var(--espresso); text-decoration: none;
+    font-size: 14px; font-weight: 600; letter-spacing: .01em;
+    transition: background .2s ease, box-shadow .2s ease;
+  }
+  #lock .ssobtn:hover { background: var(--rose); box-shadow: 0 0 28px rgba(240, 80, 42, .35); }
+  #lockOr { color: var(--taupe); font-size: 12px; margin: 0 0 14px; }
   #lockError { color: var(--brick); font-size: 13px; margin-top: 10px; min-height: 18px; }
   .shake { animation: shake .35s; }
   @keyframes shake {
@@ -551,11 +560,15 @@
     {{LOCK_MARK}}
     <h1>{{PRODUCT}}</h1>
     <p id="lockSub">Sign in</p>
-    <label for="lockUser">Username</label>
-    <input id="lockUser" type="text" autocomplete="username" autofocus>
-    <label for="lockPass">Password</label>
-    <input id="lockPass" type="password" autocomplete="current-password">
-    <button id="lockSubmit">Sign in</button>
+    <a id="lockSso" class="ssobtn" href="/api/auth/oidc/start" hidden>Sign in with SSO</a>
+    <div id="lockOr" hidden>or with a password</div>
+    <div id="lockForm">
+      <label for="lockUser">Username</label>
+      <input id="lockUser" type="text" autocomplete="username" autofocus>
+      <label for="lockPass">Password</label>
+      <input id="lockPass" type="password" autocomplete="current-password">
+      <button id="lockSubmit">Sign in</button>
+    </div>
     <div id="lockError"></div>
   </div>
 </div>
@@ -825,6 +838,10 @@
   let SETUP = false; // first-run: no admin exists yet → create one
   let OIDC = false;  // company sign-in through the IdP is configured (see oidc.js)
   let SIGNIN_TITLE = '';
+  let SSO = false;            // "Sign in with SSO" (authorization-code flow) is available
+  let SSO_BUTTON = '';
+  let PASSWORD_FORM = true;   // the username/password form stays next to it
+  let REQUIRED_ROLE = '';
   // The BASE_URL the server builds artifact links from, which is not always this page's
   // origin. Filled by loadConfig; the QR dialog shows it.
   let serverBaseUrl = location.origin;
@@ -845,7 +862,12 @@
     $('lockUser').value = '';
     $('lockPass').value = '';
     $('lockError').textContent = '';
-    $('lockUser').focus();
+    const sso = OIDC && SSO && !SETUP;
+    $('lockSso').hidden = !sso;
+    $('lockSso').textContent = SSO_BUTTON || 'Sign in with SSO';
+    $('lockForm').hidden = sso && !PASSWORD_FORM;
+    $('lockOr').hidden = !(sso && PASSWORD_FORM);
+    if (!$('lockForm').hidden) $('lockUser').focus();
   }
 
   function shakeLock() {
@@ -903,6 +925,11 @@
     try { res = await fetch('/api/auth/logout', { method: 'POST' }); } catch {}
     if (!res) return toast('Sign out failed. Check your connection and try again.', true);
     if (!res.ok) toast('Signed out here, but the server could not revoke the session. Other devices stay signed in.', true);
+    // A company sign-in also ends the IdP's SSO session, otherwise "Sign in with SSO" would sign
+    // straight back in. The IdP returns here afterwards.
+    let out = {};
+    try { out = await res.clone().json(); } catch {}
+    if (out.endSessionUrl) { location.href = out.endSessionUrl; return; }
     SETUP = false;
     showLock();
   });
@@ -2583,8 +2610,25 @@
       SETUP = !!s.needsSetup;
       OIDC = !!s.oidc;
       SIGNIN_TITLE = s.signinTitle || '';
+      SSO = !!s.sso;
+      SSO_BUTTON = s.ssoButton || '';
+      PASSWORD_FORM = s.passwordForm !== false;
+      REQUIRED_ROLE = s.requiredRole || '';
     } catch {}
     showLock();
+    // The OIDC callback reports a failed sign-in as ?signin_error=<code> (a fixed vocabulary).
+    const code = new URLSearchParams(location.search).get('signin_error');
+    if (code) {
+      const msgs = {
+        denied: 'Sign-in was cancelled or denied.',
+        forbidden: REQUIRED_ROLE ? `Signed in, but this account has no "${REQUIRED_ROLE}" role. Ask an administrator.` : 'Signed in, but this account is not allowed here.',
+        ratelimited: 'Too many attempts. Try again later.',
+        idp: 'The identity provider is unavailable. Try again.',
+        failed: 'Sign-in failed. Start again.',
+      };
+      $('lockError').textContent = msgs[code] || msgs.failed;
+      history.replaceState(null, '', location.pathname);
+    }
   })();
 </script>
 </body>
