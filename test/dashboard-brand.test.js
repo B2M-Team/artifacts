@@ -25,6 +25,11 @@ test('an unbranded dashboard is byte for byte the page that shipped', () => {
   assert.equal(render(NONE), FIXTURE);
 });
 
+test('the password form ships hidden, so an SSO-only install never shows it while the config loads', () => {
+  assert.match(PAGE, /<div id="lockForm" hidden>/);
+  assert.match(FIXTURE, /<div id="lockForm" hidden>/);
+});
+
 test('the rendered page never leaves a slot behind', () => {
   for (const b of [NONE, brand({ productName: 'Dropkiln', logoUrl: '/l.png', faviconUrl: '/f.png', accentColor: '#0055ff' })]) {
     assert.doesNotMatch(render(b), /\{\{[A-Z_]+\}\}/);
