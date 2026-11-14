@@ -140,7 +140,7 @@ has been saved. The first accepted `PUT` writes all six fields to the backend, a
 then reads those on restart and ignores the env vars. To change a saved setting across a fleet,
 `PUT` it rather than editing env.
 
-### S3 (and S3-compatible: R2, B2, MinIO, Spaces, Wasabi, GCS interop)
+### S3 (and S3-compatible: R2, B2, SeaweedFS, Spaces, Wasabi, GCS interop)
 
 ```bash
 STORAGE_BACKEND=s3 \

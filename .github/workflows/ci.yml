@@ -364,14 +364,18 @@ jobs:
       ARTIFACTS_ADMIN_PASSWORD: ci-admin-password
       PORT: 3000
       STORAGE_BACKEND: s3
-      S3_ENDPOINT: http://127.0.0.1:9000
+      S3_ENDPOINT: http://127.0.0.1:8333
       S3_REGION: us-east-1
       S3_BUCKET: artifacts
-      S3_ACCESS_KEY_ID: minioadmin
-      S3_SECRET_ACCESS_KEY: minioadmin
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      S3_ACCESS_KEY_ID: ci-access-key
+      S3_SECRET_ACCESS_KEY: ci-secret-key-12345
+      AWS_ACCESS_KEY_ID: ci-access-key
+      AWS_SECRET_ACCESS_KEY: ci-secret-key-12345
+      AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
+      # AWS CLI v2 adds CRC checksums to every request by default; only send them when the
+      # operation requires one, so bucket creation stays a plain SigV4 request.
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -379,16 +383,30 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Start MinIO + create bucket
+      - name: Start SeaweedFS + create bucket
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/ready && break
+          # One S3 identity with the job's test credentials; without -s3.config SeaweedFS
+          # accepts anonymous requests and the SigV4 path would go untested.
+          s3conf="$RUNNER_TEMP/seaweedfs-s3.json"
+          cat > "$s3conf" <<JSON
+          {"identities":[{"name":"ci","credentials":[{"accessKey":"$S3_ACCESS_KEY_ID","secretKey":"$S3_SECRET_ACCESS_KEY"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+          JSON
+          docker run -d --name seaweedfs -p 8333:8333 -v "$s3conf:/etc/s3.json:ro" \
+            chrislusf/seaweedfs:4.47 server -s3 -s3.config=/etc/s3.json -dir=/data
+          # 127.0.0.1, not localhost: localhost can resolve to ::1, where S3 may not be listening.
+          up=no
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8333) 2>/dev/null; then up=yes; break; fi
             sleep 1
           done
-          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://artifacts
+          [ "$up" = yes ] || { echo "FAIL: SeaweedFS did not open port 8333 in 60 s"; docker logs seaweedfs; exit 1; }
+          # The published port can accept connections before the filer is ready, so retry the create.
+          for _ in $(seq 1 30); do
+            aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket "$S3_BUCKET" && break
+            sleep 2
+          done
+          aws --endpoint-url "$S3_ENDPOINT" s3api head-bucket --bucket "$S3_BUCKET" \
+            || { echo "FAIL: SeaweedFS bucket was not created"; docker logs seaweedfs; exit 1; }
       - name: Boot server (s3 backend)
         run: |
           node server.js &

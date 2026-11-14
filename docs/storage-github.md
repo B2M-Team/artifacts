@@ -6,7 +6,7 @@ its data, and you get full version history of every artifact for free. ([← bac
 
 Good when you already live on GitHub and want durable storage with an audit trail and zero extra
 infrastructure. Not for high write volume — every publish is a commit + push. For an object-store
-alternative, see [S3/MinIO](deploy.md#storage-backends).
+alternative, see [S3/SeaweedFS](deploy.md#storage-backends).
 
 ## How it behaves
 
