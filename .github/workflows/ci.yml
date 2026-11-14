@@ -394,16 +394,18 @@ jobs:
           docker run -d --name seaweedfs -p 8333:8333 -v "$s3conf:/etc/s3.json:ro" \
             chrislusf/seaweedfs:4.47 server -s3 -s3.config=/etc/s3.json -dir=/data
           # 127.0.0.1, not localhost: localhost can resolve to ::1, where S3 may not be listening.
-          for i in $(seq 1 60); do
-            (exec 3<>/dev/tcp/127.0.0.1/8333) 2>/dev/null && break
+          up=no
+          for _ in $(seq 1 60); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8333) 2>/dev/null; then up=yes; break; fi
             sleep 1
           done
+          [ "$up" = yes ] || { echo "FAIL: SeaweedFS did not open port 8333 in 60 s"; docker logs seaweedfs; exit 1; }
           # The published port can accept connections before the filer is ready, so retry the create.
-          for i in $(seq 1 30); do
-            aws --endpoint-url http://127.0.0.1:8333 s3api create-bucket --bucket "$S3_BUCKET" && break
+          for _ in $(seq 1 30); do
+            aws --endpoint-url "$S3_ENDPOINT" s3api create-bucket --bucket "$S3_BUCKET" && break
             sleep 2
           done
-          aws --endpoint-url http://127.0.0.1:8333 s3api head-bucket --bucket "$S3_BUCKET" \
+          aws --endpoint-url "$S3_ENDPOINT" s3api head-bucket --bucket "$S3_BUCKET" \
             || { echo "FAIL: SeaweedFS bucket was not created"; docker logs seaweedfs; exit 1; }
       - name: Boot server (s3 backend)
         run: |
