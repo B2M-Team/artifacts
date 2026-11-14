@@ -1,5 +1,5 @@
 // S3-compatible object-storage backend. Works against AWS S3 and any S3-compatible
-// provider (Cloudflare R2, Backblaze B2, MinIO, DigitalOcean Spaces, Wasabi, GCS via S3
+// provider (Cloudflare R2, Backblaze B2, SeaweedFS, DigitalOcean Spaces, Wasabi, GCS via S3
 // interop). Uses aws4fetch — a tiny SigV4 request signer — over the heavyweight AWS SDK.
 //
 // Security notes:
