@@ -39,7 +39,7 @@ test('the expired card says 410 and names expiry', () => {
   assert.match(html, /<p class="status">410<\/p>/);
   assert.match(html, /<h1>Page expired<\/h1>/);
   assert.match(html, /<title>Page expired<\/title>/);
-  assert.match(html, /expire/);
+  assert.match(EXPIRED_COPY.MESSAGE, /expiry date/);
 });
 
 test('the missing card keeps the 404 copy it has always had', () => {

@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import { fillShell } from '../lib/shells.js';
 import { jsxBrandSlots, notFoundBrandSlots, passwordBrandSlots } from '../lib/branding.js';
 import { EXPIRED_COPY, NOT_FOUND_COPY } from '../lib/status-page.js';
+import { PDF_FALLBACK_TEXT } from '../lib/pdf-copy.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const shell = (name) => readFileSync(join(here, '..', 'shells', `${name}.html`), 'utf8');
@@ -88,9 +89,17 @@ test('no script on a viewer page builds a message that says artifact', () => {
   // visibleText drops <script>, so a string a script writes into the page would slip past it.
   // Storage keys and element ids are the only quoted "artifact" strings allowed.
   const allowed = new Set(['artifactTheme', 'artifactFrameHidden', '__artifact_error']);
-  for (const name of ['password', 'frame', 'not-found', 'md', 'jsx']) {
+  for (const name of ['password', 'frame', 'not-found', 'md', 'jsx', 'pdf']) {
     const scripts = [...shell(name).matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]).join('\n');
-    const quoted = [...scripts.matchAll(/(['"])((?:(?!\1).)*artifact(?:(?!\1).)*)\1/gi)].map((m) => m[2]);
+    const quoted = [...scripts.matchAll(/(['"`])((?:(?!\1).)*artifact(?:(?!\1).)*)\1/gi)].map((m) => m[2]);
     assert.deepEqual(quoted.filter((q) => !allowed.has(q)), [], name);
   }
+});
+
+test('the pdf page fallback says PDF, not artifact', () => {
+  // What a browser that will not render application/pdf shows in the viewer, with and without downloads.
+  for (const text of Object.values(PDF_FALLBACK_TEXT)) {
+    assert.doesNotMatch(text, /artifact/i);
+  }
+  assert.match(PDF_FALLBACK_TEXT.noDownload, /downloads are off/);
 });

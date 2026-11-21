@@ -60,6 +60,7 @@ import {
   NOT_FOUND_TEXT,
   EXPIRED_TEXT,
 } from './lib/status-page.js';
+import { PDF_FALLBACK_TEXT } from './lib/pdf-copy.js';
 import {
   dashboardBrandSlots, dashboardFavicon,
   frameBrandSlots, jsxBrandSlots, mdBrandSlots, notFoundBrandSlots, passwordBrandSlots,
@@ -386,9 +387,7 @@ function buildPdfHtml(meta) {
     // the shell's probe swaps in when a browser accepts the type and then paints nothing.
     // With downloads off there is nothing to offer there, and saying so beats a page that
     // looks broken.
-    FALLBACK_TEXT: flags.download
-      ? 'This browser will not show a PDF on the page. Open it in a new tab or save it instead.'
-      : 'This browser will not show a PDF on the page, and downloads are off for this artifact.',
+    FALLBACK_TEXT: flags.download ? PDF_FALLBACK_TEXT.download : PDF_FALLBACK_TEXT.noDownload,
     FALLBACK_LINKS: flags.download
       ? `<a class="act" href="${fileUrl}" target="_blank" rel="noopener">Open the PDF</a>\n        <a class="act" href="${downloadUrl}" download>Download the PDF</a>`
       : '',
