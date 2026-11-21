@@ -70,7 +70,7 @@ test('nothing configured keeps the colors the shells shipped with', () => {
 
 // A product name names the product, not the thing the product publishes. "Dropkiln unavailable"
 // on a dead link reads as "the service is down", and "This Dropkiln is password protected" is not
-// a sentence. The noun stays `artifact` and the brand goes where a brand belongs.
+// a sentence. The noun stays `page` and the brand goes where a brand belongs.
 test('a product name never becomes the noun for a published item', () => {
   const b = brand({ productName: 'Dropkiln' });
   for (const slots of [passwordBrandSlots, notFoundBrandSlots, frameBrandSlots]) {
@@ -80,12 +80,12 @@ test('a product name never becomes the noun for a published item', () => {
   for (const name of ['password', 'not-found', 'frame']) {
     assert.ok(!shellText(name).includes('{{PRODUCT_'), `${name}.html still has a product-name slot`);
   }
-  assert.match(shellText('password'), /<h1>Protected artifact<\/h1>/);
+  assert.match(shellText('password'), /<h1>Protected page<\/h1>/);
   // not-found.html holds its headline in a slot now, so the fixed noun lives in
-  // lib/status-page.js. Both cards it renders still name the artifact, never the product.
+  // lib/status-page.js. Both cards it renders still name the page, never the product.
   for (const copy of [NOT_FOUND_COPY, EXPIRED_COPY]) {
     const page = fillShell(shellText('not-found'), { ...notFoundBrandSlots(b), ...copy });
-    assert.match(page, /<h1>Artifact (unavailable|expired)<\/h1>/);
+    assert.match(page, /<h1>Page (unavailable|expired)<\/h1>/);
     assert.ok(!page.includes('Dropkiln'), 'the card never carries the product name');
   }
 });
@@ -224,7 +224,7 @@ test('branding text is escaped on the way into the page', () => {
 });
 
 test('the jsx error label follows the product name', () => {
-  assert.equal(jsxBrandSlots(NONE).ERROR_LABEL, "'Artifact error: '");
+  assert.equal(jsxBrandSlots(NONE).ERROR_LABEL, "'Page error: '");
   assert.equal(jsxBrandSlots(brand({ productName: 'Dropkiln' })).ERROR_LABEL, '"Dropkiln error: "');
 });
 
