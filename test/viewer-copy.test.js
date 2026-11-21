@@ -58,6 +58,8 @@ test('a jsx page that throws does not show the word artifact', () => {
   assert.doesNotMatch(shell('jsx'), /data-filename="[^"]*artifact/i);
 });
 
+// The three CSS tests below guard the rule text against a revert. Whether the rule wins the
+// cascade was checked in screenshots; a later rule that outranks these would not fail here.
 test('the 404 footer line sits apart from the message', () => {
   // The shell styles its last paragraph with `p:last-child` (0,1,1), and the footer is that last
   // paragraph, so a bare `.brandfooter` (0,1,0) lost: no gap, message-sized text, and the footer
@@ -80,4 +82,15 @@ test('the gate footer line keeps its own gap', () => {
   // lost its top margin and sat flush under "Incorrect password".
   const slots = passwordBrandSlots({ ...NONE, footerText: 'Published with Shahin' });
   assert.match(slots.BRAND_STYLE, /#card \.brandfooter \{ margin: 14px 0 0; font-size: 12px;/);
+});
+
+test('no script on a viewer page builds a message that says artifact', () => {
+  // visibleText drops <script>, so a string a script writes into the page would slip past it.
+  // Storage keys and element ids are the only quoted "artifact" strings allowed.
+  const allowed = new Set(['artifactTheme', 'artifactFrameHidden', '__artifact_error']);
+  for (const name of ['password', 'frame', 'not-found', 'md', 'jsx']) {
+    const scripts = [...shell(name).matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]).join('\n');
+    const quoted = [...scripts.matchAll(/(['"])((?:(?!\1).)*artifact(?:(?!\1).)*)\1/gi)].map((m) => m[2]);
+    assert.deepEqual(quoted.filter((q) => !allowed.has(q)), [], name);
+  }
 });

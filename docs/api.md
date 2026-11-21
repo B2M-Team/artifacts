@@ -121,8 +121,8 @@ the 404 says "Page unavailable" and the gate says "Protected page" on every inst
 "Dropkiln unavailable" reads as "the service is down" rather than "this link is wrong". A viewer
 reads "page" everywhere: "artifact" is the publisher's word, and the viewer screens never show it.
 The one-line `artifact expired` body a non-browser client gets is unchanged, because scripts match on it.
-A jsx page keeps the error label it was built with, so one published before this wording still
-says "Artifact error:" until it is republished.
+A jsx page keeps the error label and Babel filename it was built with, so one published before
+this wording still says "Artifact error:" and `artifact.tsx` until it is republished.
 
 `accentColor` takes over every accent role in a shell at once, the two translucent washes
 included, which `color-mix()` derives from the same value, and it drives the operator console as
