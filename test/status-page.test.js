@@ -37,16 +37,16 @@ test('curl, fetch and a sub-resource read keep the plain body', () => {
 test('the expired card says 410 and names expiry', () => {
   const html = render(EXPIRED_COPY);
   assert.match(html, /<p class="status">410<\/p>/);
-  assert.match(html, /<h1>Artifact expired<\/h1>/);
-  assert.match(html, /<title>Artifact expired<\/title>/);
-  assert.match(html, /expire/);
+  assert.match(html, /<h1>Page expired<\/h1>/);
+  assert.match(html, /<title>Page expired<\/title>/);
+  assert.match(EXPIRED_COPY.MESSAGE, /expiry date/);
 });
 
 test('the missing card keeps the 404 copy it has always had', () => {
   const html = render(NOT_FOUND_COPY);
   assert.match(html, /<p class="status">404<\/p>/);
-  assert.match(html, /<h1>Artifact unavailable<\/h1>/);
-  assert.match(html, /<title>Artifact unavailable<\/title>/);
+  assert.match(html, /<h1>Page unavailable<\/h1>/);
+  assert.match(html, /<title>Page unavailable<\/title>/);
 });
 
 test('neither card ships an unfilled slot', () => {

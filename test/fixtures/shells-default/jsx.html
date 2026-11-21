@@ -24,10 +24,10 @@
   window.addEventListener('error', function (e) {
     var el = document.getElementById('__artifact_error');
     el.style.display = 'block';
-    el.textContent = 'Artifact error: ' + e.message;
+    el.textContent = 'Page error: ' + e.message;
   });
 </script>
-<script type="text/babel" data-type="module" data-presets="react,typescript" data-filename="artifact.tsx">
+<script type="text/babel" data-type="module" data-presets="react,typescript" data-filename="page.tsx">
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 

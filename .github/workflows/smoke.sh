@@ -76,7 +76,7 @@ notfound_body=$(mktemp)
 code=$(curl -s -D "$notfound_headers" -o "$notfound_body" -w '%{http_code}' "$BASE/a/does-not-exist-zzz")
 expect_code 404 "$code" "missing artifact"
 grep -qi '^Content-Type: text/html' "$notfound_headers" || fail "missing artifact is not HTML"
-grep -q 'Artifact unavailable' "$notfound_body" || fail "missing artifact page copy missing"
+grep -q 'Page unavailable' "$notfound_body" || fail "missing page copy missing"
 rm "$notfound_headers"
 rm "$notfound_body"
 echo "ok: branded artifact-not-found page"
@@ -178,9 +178,9 @@ code=$(curl -s -H 'Accept: text/html' -D "$expired_headers" -o "$expired_body" -
 expect_code 410 "$code" "expired artifact page"
 grep -qi '^Content-Type: text/html' "$expired_headers" || fail "expired artifact is not HTML"
 grep -qi '^Vary: Accept' "$expired_headers" || fail "expired card has no Vary: Accept"
-grep -q 'Artifact expired' "$expired_body" || fail "expired page copy missing"
+grep -q 'Page expired' "$expired_body" || fail "expired page copy missing"
 grep -q '<p class="status">410</p>' "$expired_body" || fail "expired page does not show 410"
-grep -q 'Artifact unavailable' "$expired_body" && fail "expired page reuses the 404 copy"
+grep -q 'Page unavailable' "$expired_body" && fail "expired page reuses the 404 copy"
 rm "$expired_headers"
 rm "$expired_body"
 echo "ok: branded artifact-expired page"
@@ -205,7 +205,7 @@ echo "ok: the expired page splits by Accept"
 curl -s "$BASE/a/ci-smoke/source" | grep -q '^artifact expired$' || fail "expired source body changed for a machine"
 card=$(mktemp)
 curl -s -H 'Accept: text/html' -o "$card" "$BASE/a/ci-smoke/source"
-grep -q 'Artifact expired' "$card" || fail "expired source has no card for a browser"
+grep -q 'Page expired' "$card" || fail "expired source has no card for a browser"
 rm "$card"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Accept: text/html' "$BASE/a/ci-smoke/source")
 expect_code 410 "$code" "expired source keeps its status for a browser"
@@ -999,7 +999,7 @@ expect_code 404 "$code" "zip miss, no 404.html in zip"
 curl -s "$BASE/a/ci-zip/nope.html" | grep -q '^not found$' || fail "zip miss body changed"
 zipmiss=$(mktemp)
 curl -s -H 'Accept: text/html' -o "$zipmiss" "$BASE/a/ci-zip/nope.html"
-grep -q 'Artifact unavailable' "$zipmiss" || fail "zip miss has no card for a browser"
+grep -q 'Page unavailable' "$zipmiss" || fail "zip miss has no card for a browser"
 rm "$zipmiss"
 echo "ok: zip miss falls back to plain not-found"
 
@@ -1372,7 +1372,7 @@ curl -sf -X POST "$BASE/api/artifacts" -H "$AUTH" -H "$JSON" \
   -d '{"content":"export default function A(){ return <div>brand</div>; }","type":"jsx","slug":"ci-brand-jsx","visibility":"public"}' > /dev/null
 if [ "$host_branded" = no ]; then
   curl -s "$BASE/a/ci-brand-md?raw=1" | grep -q -- '--link: #c73d1d' || fail "md page is not on the default link color"
-  curl -s "$BASE/a/ci-brand-jsx?raw=1" | grep -qF "'Artifact error: '" || fail "jsx page is not on the default error label"
+  curl -s "$BASE/a/ci-brand-jsx?raw=1" | grep -qF "'Page error: '" || fail "jsx page is not on the default error label"
   if curl -s "$BASE/a/ci-brand-md" | grep -q 'og:site_name'; then fail "og:site_name rendered with no product name set"; fi
   echo "ok: shells render the built-in branding by default"
 fi
@@ -1386,12 +1386,12 @@ echo "$body" | grep -q '#0055ff' || fail "404 page kept the built-in accent colo
 echo "$body" | grep -q 'Published with Smokebrand' || fail "404 page missing the branded footer"
 echo "$body" | grep -q '<img class="mark" src="/brand/logo.png"' || fail "404 page kept the built-in mark"
 # The product name is the name of the product, not a count noun for what it publishes. A viewer
-# on a dead link reads "Artifact unavailable" on every install, branded or not.
-echo "$body" | grep -q 'Artifact unavailable' || fail "404 page put the product name where the noun goes"
+# on a dead link reads "Page unavailable" on every install, branded or not.
+echo "$body" | grep -q 'Page unavailable' || fail "404 page put the product name where the noun goes"
 body=$(curl -s "$BASE/a/cap-pw")
 echo "$body" | grep -q '#0055ff' || fail "password page kept the built-in accent color"
 echo "$body" | grep -q '<link rel="icon" href="/brand/f.ico">' || fail "password page missing the branded favicon"
-echo "$body" | grep -q 'Protected artifact' || fail "password page put the product name where the noun goes"
+echo "$body" | grep -q 'Protected page' || fail "password page put the product name where the noun goes"
 body=$(curl -s "$BASE/a/ci-brand-md?raw=1")
 echo "$body" | grep -q -- '--link: #0055ff' || fail "md page kept the built-in link color"
 echo "$body" | grep -q '<link rel="icon" href="/brand/f.ico">' || fail "md page missing the branded favicon"
@@ -1404,7 +1404,7 @@ body=$(curl -s "$BASE/a/ci-brand-jsx-2?raw=1")
 echo "$body" | grep -qF '"Smokebrand error: "' || fail "jsx page kept the built-in error label"
 echo "$body" | grep -q '<link rel="icon" href="/brand/f.ico">' || fail "jsx page missing the branded favicon"
 if [ "$host_branded" = no ]; then
-  curl -s "$BASE/a/ci-brand-jsx?raw=1" | grep -qF "'Artifact error: '" || fail "an older jsx page changed under it"
+  curl -s "$BASE/a/ci-brand-jsx?raw=1" | grep -qF "'Page error: '" || fail "an older jsx page changed under it"
 fi
 echo "ok: branding rebrands the 404, password, md, jsx and frame shells"
 
