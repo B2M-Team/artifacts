@@ -17,7 +17,6 @@ test('plain names are taken exactly as before', () => {
 
 test('an e-mail user name is a project label', () => {
   assert.equal(parseProject('gt.owner@gcc-telco.example'), 'gt.owner@gcc-telco.example');
-  assert.equal(parseProject('a+b@x.co'), 'a+b@x.co');
   assert.equal(parseProject('ali@ü-mail.de'), 'ali@ü-mail.de', 'Unicode letters were already allowed in a plain name');
   assert.equal(parseProject('x@1.2.example'), 'x@1.2.example');
   const long = `${'a'.repeat(64)}@${'b'.repeat(180)}.example`;
@@ -27,7 +26,7 @@ test('an e-mail user name is a project label', () => {
 test('what was refused stays refused, and a broken e-mail is refused too', () => {
   for (const bad of ['-lead', '.hidden', 'a/b', 'x'.repeat(65), 'a%b', 'a#b', 'a?b',
     '@x.co', 'a@', 'a@@b.co', 'a@b@c.co', 'a..b@x.co', 'a@x..co', '.a@x.co', 'a.@x.co', 'a b@x.co',
-    'a@x.co/..', `${'a'.repeat(250)}@x.co`, 'a@b', 'a@1', 'a@b-.c', 'a@b.-c', 'a@-b.c', 'a@b.', 'a@b c.co']) {
+    'a@x.co/..', `${'a'.repeat(250)}@x.co`, 'a@b', 'a@1', 'a@b-.c', 'a@b.-c', 'a@-b.c', 'a@b.', 'a@b c.co', 'a+b@x.co']) {
     assert.throws(() => parseProject(bad), (e) => e instanceof ApiError && e.status === 400, bad);
   }
   assert.throws(() => parseProject(5), (e) => e instanceof ApiError && e.message === 'project must be a string');
