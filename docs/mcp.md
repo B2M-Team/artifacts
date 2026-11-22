@@ -17,7 +17,7 @@ Every tool the server registers. `?` marks an optional argument.
 | `rename_artifact` | `slug`, `newSlug` | new share URL (tokened for private/password) |
 | `set_artifact_expiry` | `slug`, `expiresAt` (ISO 8601, or `null` to clear) | confirmation |
 | `set_artifact_tags` | `slug`, `tags` (full list; empty array clears) | confirmation |
-| `set_artifact_project` | `slug`, `project` (1 to 64 chars of letters, digits, spaces and `-` `_` `.`, starting with a letter or digit; empty string clears) | confirmation |
+| `set_artifact_project` | `slug`, `project` (1 to 64 chars of letters, digits, spaces and `-` `_` `.`, starting with a letter or digit, or an e-mail address of up to 254 chars; empty string clears) | confirmation |
 | `set_artifact_visibility` | `slug`, `visibility` (`public`/`private`/`password`), `password?` | confirmation |
 | `set_artifact_frame` | `slug`, `frame` (`true` framed, `false` unframed, `null` inherits the server default) | confirmation |
 | `disable_artifact` | `slug` | confirmation (URL serves 404, content kept) |
