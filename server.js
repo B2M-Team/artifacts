@@ -256,9 +256,7 @@ const TYPES = Object.keys(SOURCE_EXT);
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{2,63}$/;
 const TAG_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const MAX_TAGS = 10;
-// A project is a single grouping label (one per artifact). Friendlier than a
-// slug — Unicode letters/digits, spaces, and - _ . — but bounded, and must
-// start with a letter or digit. Internal whitespace is collapsed on input.
+// A project is a single grouping label (one per artifact): lib/project.js has the rule.
 
 // Pinned versions shared with the jsx shell. `external=react` keeps packages on
 // the shell's React instance — separate copies cause "Invalid hook call".
@@ -2323,7 +2321,7 @@ function createMcpServer(scopes = SCOPES, keyId = null) {
         project: z
           .string()
           .optional()
-          .describe('Project this artifact belongs to (single grouping label): 1 to 64 chars of letters, digits, spaces, and - _ . (starting with a letter or digit)'),
+          .describe('Project this artifact belongs to (single grouping label): 1 to 64 chars of letters, digits, spaces, and - _ . (starting with a letter or digit), or an e-mail address of up to 254 chars'),
         visibility: z
           .enum(['public', 'private', 'password'])
           .optional()
@@ -2467,7 +2465,7 @@ function createMcpServer(scopes = SCOPES, keyId = null) {
         slug: z.string(),
         project: z
           .string()
-          .describe('Project name: 1 to 64 chars of letters, digits, spaces, and - _ . (starting with a letter or digit). Empty string clears it'),
+          .describe('Project name: 1 to 64 chars of letters, digits, spaces, and - _ . (starting with a letter or digit), or an e-mail address of up to 254 chars. Empty string clears it'),
       },
     },
     async ({ slug, project }) => {
